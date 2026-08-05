@@ -49,11 +49,20 @@ CACHE_PATH = os.path.join(STATE_DIR, "cache.json")
 # Menu-bar colour thresholds, by percent of a limit consumed. Only the "NN%"
 # itself is tinted -- the tag and the countdown stay in the system colour so
 # they remain readable in both light and dark mode.
-COLOR_WARN_AT = 60
-COLOR_ALERT_AT = 85
-ANSI_GREEN = 42
-ANSI_AMBER = 208
-ANSI_RED = 196
+#
+# Thresholds and colours deliberately mirror the Claude Code statusline, so the
+# same figure reads the same in both places.
+COLOR_WARN_AT = 50
+COLOR_ALERT_AT = 80
+
+# (xterm-256 index, rgb). SwiftBar does not resolve 256-colour indices the way a
+# standards-compliant terminal does -- index 42 is rgb(0,215,135), a green, but
+# renders blue in the menu bar. So 24-bit truecolor is emitted by default and the
+# index is kept only as a fallback, selectable with "color_mode": "256" in
+# config.json.
+GREEN = (42, (0, 215, 135))
+AMBER = (220, (255, 215, 0))
+RED = (196, (255, 0, 0))
 
 # The usage endpoint rate-limits aggressively (observed: HTTP 429 with
 # retry-after ~275s after roughly a dozen calls). So the plugin's refresh
@@ -72,9 +81,10 @@ SWIFTBAR_BINARY = "/Applications/SwiftBar.app/Contents/MacOS/SwiftBar"
 MONO = "font=Menlo size=12"
 DIM = "color=#8a8a8e"
 
-# Dropdown row colour. Normal rows are left untinted so they keep the system
-# colour and stay readable in both light and dark mode.
-SEVERITY_COLOR = {"warning": "#e8a33d", "critical": "#e5534b", "severe": "#e5534b"}
+# Dropdown row colour, as hex because SwiftBar's own `color=` takes hex directly.
+# Same values as the menu-bar palette above. Normal rows are left untinted so
+# they keep the system colour and stay readable in both light and dark mode.
+SEVERITY_COLOR = {"warning": "#FFD700", "critical": "#FF0000", "severe": "#FF0000"}
 SEVERITY_RANK = {"normal": 0, "warning": 1, "critical": 2, "severe": 2}
 
 # SwiftBar parses "text | key=value" per line, so a "|", a newline, or an ANSI
@@ -444,18 +454,23 @@ def collect_limits(data):
 # --------------------------------------------------------------------------
 
 
-def ansi_wrap(text, code):
-    return text if code is None else f"\033[38;5;{code}m{text}\033[0m"
+def ansi_wrap(text, colour, mode="truecolor"):
+    if colour is None:
+        return text
+    index, (red, green, blue) = colour
+    if mode == "256":
+        return f"\033[38;5;{index}m{text}\033[0m"
+    return f"\033[38;2;{red};{green};{blue}m{text}\033[0m"
 
 
 def alert_code(percent, severity="normal"):
     """Green below the warn threshold, then amber, then red. The server's own
     severity can escalate early -- whichever trips first wins."""
     if percent >= COLOR_ALERT_AT or SEVERITY_RANK.get(severity, 0) >= 2:
-        return ANSI_RED
+        return RED
     if percent >= COLOR_WARN_AT or SEVERITY_RANK.get(severity, 0) == 1:
-        return ANSI_AMBER
-    return ANSI_GREEN
+        return AMBER
+    return GREEN
 
 
 def format_wait(seconds):
@@ -468,13 +483,19 @@ def format_wait(seconds):
 
 def status_line(error, backoff_until):
     """Recomputed every render, so the wait counts down instead of showing the
-    figure that happened to be true when the request failed."""
+    figure that happened to be true when the request failed.
+
+    The absolute time leads because SwiftBar does not redraw an already-open
+    dropdown: the countdown is a snapshot from the last render and goes stale
+    while you read it, whereas the clock time stays correct.
+    """
     if not error:
         return None
     remaining = int(backoff_until - time.time())
-    if remaining > 0:
-        return f"{error}, retrying in {format_wait(remaining)}"
-    return f"{error}, retrying on next refresh"
+    if remaining <= 0:
+        return f"{error}, retrying on next refresh"
+    at = datetime.fromtimestamp(backoff_until)
+    return f"{error}, retrying at {at:%H:%M:%S} (in {format_wait(remaining)})"
 
 
 def credit_chip(spend):
@@ -497,11 +518,14 @@ def render(data, plan, config, age=None, error=None, backoff_until=0):
     # Menu bar: "S:46% (3h39m) W:7% (5d0h)". Each limit's percentage is tinted
     # on its own, so you can see at a glance *which* one is the tight one.
     use_color = bool(config.get("color", True))
+    mode = config.get("color_mode", "truecolor")
     chips = []
     for row in rows:
         percent = f"{round(row['percent'])}%"
         if use_color:
-            percent = ansi_wrap(percent, alert_code(row["percent"], row["severity"]))
+            percent = ansi_wrap(
+                percent, alert_code(row["percent"], row["severity"]), mode
+            )
         chip = f"{row['tag']}:{percent}"
         span = compact_duration(seconds_until(row["resets_at"]))
         if span:
@@ -516,6 +540,7 @@ def render(data, plan, config, age=None, error=None, backoff_until=0):
                     alert_code(
                         spend.get("percent") or 0, spend.get("severity") or "normal"
                     ),
+                    mode,
                 )
             chips.append(chip)
 
