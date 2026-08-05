@@ -51,8 +51,8 @@ ditto SwiftBar.app /Applications/SwiftBar.app
 
 ```sh
 mkdir -p ~/.swiftbar
-cp claude-usage.60s.py ~/.swiftbar/
-chmod +x ~/.swiftbar/claude-usage.60s.py
+cp claude-usage.10s.py ~/.swiftbar/
+chmod +x ~/.swiftbar/claude-usage.10s.py
 defaults write com.ameba.SwiftBar PluginDirectory -string "$HOME/.swiftbar"
 open /Applications/SwiftBar.app
 ```
@@ -90,20 +90,25 @@ keychain, which is the same endpoint Claude Code's `/usage` command uses.
 withdrawn without notice. If that happens, the plugin shows a dim `Claude: ...` with the
 reason in the dropdown rather than breaking your menu bar.
 
-### Why 60 seconds, and why that isn't configurable
+### Refresh: 10s on screen, at most once a minute on the wire
 
-The endpoint rate-limits hard. Around a dozen calls in a few minutes earns an HTTP 429
-with a `retry-after` of several minutes. So:
+The endpoint rate-limits hard. Around a dozen calls in a few minutes earns an HTTP 429,
+and it has been observed returning `retry-after: 0` while still refusing, so that header
+cannot be trusted as guidance on its own. Rendering and fetching are therefore separate:
 
-- the network is touched **at most once a minute**, and backs off when told to. The
-  server's `retry-after` is honoured, clamped to one hour so a bad value cannot wedge it.
+- SwiftBar re-renders every **10s**, set by the filename. This is display only, costs no
+  network, and lets the retry countdown tick in seconds.
+- the network is touched **at most once a minute**, and only when not already backing off.
+- failures back off **exponentially**: 60s, doubling per consecutive failure, capped at one
+  hour. A server `retry-after` is honoured only when it asks for longer than that.
 - reset countdowns are recomputed **locally** on every render, so they stay accurate
   between polls.
 - percentages come from cache, and are marked with a trailing character plus an
   "as of" time once genuinely stale.
 
-Since the countdowns display at minute granularity, refreshing faster than 60s would
-change nothing on screen while making the throttling worse. Hence no interval setting.
+To change the render rate, rename the file, for example `claude-usage.30s.py`. Only the
+display rate changes; the once-a-minute network floor is enforced in code, not by the
+filename.
 
 ### Hardening
 
@@ -118,7 +123,7 @@ change nothing on screen while making the throttling worse. Hence no interval se
 ## Uninstall
 
 ```sh
-rm ~/.swiftbar/claude-usage.60s.py
+rm ~/.swiftbar/claude-usage.10s.py
 rm -rf ~/.config/swiftbar-claude-usage
 rm -f ~/Library/LaunchAgents/com.ameba.SwiftBar.plist
 ```

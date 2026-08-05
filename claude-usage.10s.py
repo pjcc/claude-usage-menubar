@@ -12,9 +12,10 @@
 # internal and undocumented -- if its shape changes this plugin degrades to a
 # dim placeholder rather than breaking the menu bar.
 #
-# Refresh is fixed at 60s (the filename sets it). Faster is pointless: the
-# countdowns render at minute granularity so nothing on screen would change,
-# and the endpoint won't tolerate it anyway -- see MIN_FETCH_SECONDS.
+# The filename sets how often SwiftBar re-renders (10s). That drives the
+# *display* only, so the retry countdown ticks in seconds. The network is
+# touched at most once a minute and backs off exponentially on failure --
+# see MIN_FETCH_SECONDS and backoff_for().
 #
 # Self-invoking actions (driven by the dropdown):
 #   --toggle-credits   flip the credits chip on/off in the menu bar
@@ -258,10 +259,12 @@ def toggle_login():
 
 
 def force_refresh():
-    """Clear the local throttle so the next render fetches. Deliberately leaves
-    backoff_until alone -- if the server said wait, we wait."""
+    """Clear the local throttle so the next render fetches. Clears last_attempt
+    rather than fetched_at: fetched_at means 'when we last had good data' and
+    zeroing it made a failed forced refresh look infinitely stale forever.
+    Deliberately leaves backoff_until alone -- if the server said wait, we wait."""
     cache = load_cache()
-    cache["fetched_at"] = 0
+    cache["last_attempt"] = 0
     save_cache(cache)
     nudge_swiftbar()
 
@@ -276,6 +279,23 @@ def toggle_color():
 # --------------------------------------------------------------------------
 # data
 # --------------------------------------------------------------------------
+
+
+def backoff_for(fails, err=None):
+    """Seconds to wait after a failed attempt.
+
+    Doubles per consecutive failure. The server's retry-after is honoured only
+    when it asks for *longer*: it has been observed returning `retry-after: 0`
+    while still refusing, and obeying that literally means retrying immediately
+    and forever, which is what keeps the limit tripped.
+    """
+    wait = MIN_FETCH_SECONDS * (2 ** min(fails - 1, 8))
+    if err is not None:
+        try:
+            wait = max(wait, int(err.headers.get("retry-after") or 0))
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return min(wait, MAX_BACKOFF_SECONDS)
 
 
 def credentials():
@@ -438,6 +458,25 @@ def alert_code(percent, severity="normal"):
     return ANSI_GREEN
 
 
+def format_wait(seconds):
+    """Always keep seconds visible so the countdown is seen to move."""
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes}m {seconds:02d}s"
+
+
+def status_line(error, backoff_until):
+    """Recomputed every render, so the wait counts down instead of showing the
+    figure that happened to be true when the request failed."""
+    if not error:
+        return None
+    remaining = int(backoff_until - time.time())
+    if remaining > 0:
+        return f"{error}, retrying in {format_wait(remaining)}"
+    return f"{error}, retrying on next refresh"
+
+
 def credit_chip(spend):
     """'$0/25' -- symbol once, minor units dropped when whole."""
     used = money(spend.get("used"), compact=True)
@@ -450,7 +489,7 @@ def credit_chip(spend):
     return f"{used}/{limit}"
 
 
-def render(data, plan, config, age=0, error=None):
+def render(data, plan, config, age=None, error=None, backoff_until=0):
     rows = collect_limits(data)
     spend = data.get("spend") if isinstance(data.get("spend"), dict) else {}
     show_credits = bool(config.get("show_credits", False))
@@ -483,7 +522,7 @@ def render(data, plan, config, age=0, error=None):
     title = " ".join(chips) if chips else "Claude: ..."
     # Countdowns stay accurate regardless of age (they're computed locally), so
     # only the percentages go stale -- flag it discreetly rather than shouting.
-    if age > STALE_AFTER_SECONDS:
+    if age is None or age > STALE_AFTER_SECONDS:
         title += " ⋯"
 
     # Off means off: no ANSI, no line colour, just the system text colour.
@@ -516,11 +555,17 @@ def render(data, plan, config, age=0, error=None):
     plan = sanitize(plan, limit=24)
     if plan:
         print(f"Plan: {plan.capitalize()} | {DIM}")
-    stamp = datetime.fromtimestamp(time.time() - age)
-    suffix = f" ({compact_duration(int(age))} ago)" if age > STALE_AFTER_SECONDS else ""
-    print(f"Percentages as of {stamp:%H:%M:%S}{suffix} | {DIM}")
-    if error:
-        print(f"⚠ {sanitize(redact(error), limit=120)} | {DIM}")
+    if age is None:
+        print(f"No successful fetch yet, showing cached figures | {DIM}")
+    else:
+        stamp = datetime.fromtimestamp(time.time() - age)
+        suffix = (
+            f" ({compact_duration(int(age))} ago)" if age > STALE_AFTER_SECONDS else ""
+        )
+        print(f"Percentages as of {stamp:%H:%M:%S}{suffix} | {DIM}")
+    line = status_line(error, backoff_until)
+    if line:
+        print(f"⚠ {sanitize(redact(line), limit=120)} | {DIM}")
     print(
         f"Refresh now | bash=\"{SELF}\" param1=--force-refresh "
         f"terminal=false refresh=true"
@@ -546,9 +591,10 @@ def print_controls(config):
     toggle_line("Open at login", login_enabled(), "--toggle-login")
 
 
-def fail(detail, config):
+def fail(detail, config, backoff_until=0):
     print(f"Claude: ... | {DIM}")
     print("---")
+    detail = status_line(detail, backoff_until) or detail
     print(f"Couldn't read usage: {sanitize(redact(detail), limit=120)} | {MONO}")
     print("---")
     print_controls(config)
@@ -584,10 +630,14 @@ def main():
 
     cache = load_cache()
     now = time.time()
-    due = now - cache.get("fetched_at", 0) >= MIN_FETCH_SECONDS
+    # last_attempt gates the network; fetched_at records when data was last good.
+    # Keeping them separate matters: a failed attempt must not make the cached
+    # figures look fresh, and must not make them look infinitely stale either.
+    due = now - cache.get("last_attempt", 0) >= MIN_FETCH_SECONDS
     blocked = now < cache.get("backoff_until", 0)
 
     if due and not blocked:
+        cache["last_attempt"] = now
         try:
             access_token, plan = credentials()
             cache.update(
@@ -597,35 +647,39 @@ def main():
                     "fetched_at": now,
                     "backoff_until": 0,
                     "error": None,
+                    "fails": 0,
                 }
             )
         except urllib.error.HTTPError as err:
-            wait = DEFAULT_BACKOFF_SECONDS
-            if err.code == 429:
-                try:
-                    wait = int(err.headers.get("retry-after") or wait)
-                except (TypeError, ValueError):
-                    pass
-                # Clamp: a malformed or absurd retry-after shouldn't be able to
-                # wedge the plugin until the next login.
-                wait = max(MIN_FETCH_SECONDS, min(wait, MAX_BACKOFF_SECONDS))
-                cache["error"] = f"rate limited, retrying in {wait}s"
-            else:
-                cache["error"] = f"HTTP {err.code} from usage endpoint"
-            cache["backoff_until"] = now + wait
+            fails = cache.get("fails", 0) + 1
+            cache["fails"] = fails
+            cache["error"] = (
+                "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
+            )
+            cache["backoff_until"] = now + backoff_for(fails, err)
         except Exception as err:  # noqa: BLE001 - never let the menu bar break
+            fails = cache.get("fails", 0) + 1
+            cache["fails"] = fails
             # redact: an exception string could conceivably carry the token.
             cache["error"] = redact(err) or err.__class__.__name__
-            cache["backoff_until"] = now + MIN_FETCH_SECONDS
+            cache["backoff_until"] = now + backoff_for(fails)
         save_cache(cache)
 
     data = cache.get("data")
     if not isinstance(data, dict):
-        fail(cache.get("error") or "no data yet", config)
+        fail(cache.get("error") or "no data yet", config, cache.get("backoff_until", 0))
         return
 
-    age = now - cache.get("fetched_at", 0)
-    render(data, cache.get("plan") or "", config, age, cache.get("error"))
+    fetched_at = cache.get("fetched_at", 0)
+    age = now - fetched_at if fetched_at else None
+    render(
+        data,
+        cache.get("plan") or "",
+        config,
+        age,
+        cache.get("error"),
+        cache.get("backoff_until", 0),
+    )
 
 
 if __name__ == "__main__":
