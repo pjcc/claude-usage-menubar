@@ -45,6 +45,11 @@ SELF = os.path.abspath(__file__)
 STATE_DIR = os.path.expanduser("~/.config/swiftbar-claude-usage")
 CONFIG_PATH = os.path.join(STATE_DIR, "config.json")
 CACHE_PATH = os.path.join(STATE_DIR, "cache.json")
+# Sidecar for the Claude Code statusline: one space-separated line it can read
+# with the bash `read` builtin. The statusline avoids subprocesses on purpose,
+# so it should not have to parse the pretty-printed cache JSON -- and it must
+# never hit the network itself, since it re-renders on every message.
+STATUSLINE_PATH = os.path.join(STATE_DIR, "statusline")
 
 # Menu-bar colour thresholds, by percent of a limit consumed. Only the "NN%"
 # itself is tinted -- the tag and the countdown stay in the system colour so
@@ -136,8 +141,12 @@ def redact(value):
 
 
 def write_json(path, payload):
-    """Atomic, owner-only. Atomic so a crash mid-write can't leave corrupt JSON
-    behind; 0600 because the cache holds usage and spend figures."""
+    write_atomic(path, json.dumps(payload, indent=2))
+
+
+def write_atomic(path, text):
+    """Atomic, owner-only. Atomic so a crash mid-write can't leave a truncated
+    file behind; 0600 because this holds usage and spend figures."""
     try:
         os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
         os.chmod(STATE_DIR, 0o700)
@@ -150,7 +159,7 @@ def write_json(path, payload):
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w") as handle:
-            json.dump(payload, handle, indent=2)
+            handle.write(text)
         os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
@@ -185,6 +194,36 @@ def load_cache():
 def save_cache(cache):
     try:
         write_json(CACHE_PATH, cache)
+    except OSError:
+        pass
+
+
+def write_statusline_sidecar(data):
+    """used limit currency exponent percent epoch -- removed when the account has
+    no extra-usage credits, so a stale chip can't outlive the feature."""
+    spend = data.get("spend") if isinstance(data.get("spend"), dict) else {}
+    used, limit = spend.get("used"), spend.get("limit")
+    if not (
+        spend.get("enabled")
+        and isinstance(used, dict)
+        and isinstance(limit, dict)
+        and used.get("amount_minor") is not None
+    ):
+        try:
+            os.remove(STATUSLINE_PATH)
+        except OSError:
+            pass
+        return
+    fields = (
+        int(used.get("amount_minor") or 0),
+        int(limit.get("amount_minor") or 0),
+        sanitize(used.get("currency") or "", limit=4) or "?",
+        int(used.get("exponent") or 2),
+        int(spend.get("percent") or 0),
+        int(time.time()),
+    )
+    try:
+        write_atomic(STATUSLINE_PATH, " ".join(str(f) for f in fields) + "\n")
     except OSError:
         pass
 
@@ -680,6 +719,7 @@ def main():
                     "fails": 0,
                 }
             )
+            write_statusline_sidecar(cache["data"])
         except urllib.error.HTTPError as err:
             fails = cache.get("fails", 0) + 1
             cache["fails"] = fails
