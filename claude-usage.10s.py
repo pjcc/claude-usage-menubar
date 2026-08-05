@@ -55,12 +55,16 @@ CACHE_PATH = os.path.join(STATE_DIR, "cache.json")
 COLOR_WARN_AT = 50
 COLOR_ALERT_AT = 80
 
-# (xterm-256 index, rgb). SwiftBar does not resolve 256-colour indices the way a
-# standards-compliant terminal does -- index 42 is rgb(0,215,135), a green, but
-# renders blue in the menu bar. So 24-bit truecolor is emitted by default and the
-# index is kept only as a fallback, selectable with "color_mode": "256" in
-# config.json.
-GREEN = (42, (0, 215, 135))
+# (xterm-256 index, rgb).
+#
+# Two things learned the hard way here:
+#   1. SwiftBar does NOT support 24-bit truecolor (`38;2;r;g;b`). It drops the
+#      sequence silently, so the text renders with no colour at all rather than
+#      falling back. 256-index (`38;5;n`) is the only form that works.
+#   2. The statusline's green is index 42 = rgb(0,215,135), whose blue channel is
+#      135. In a terminal that reads green; in the menu bar it reads teal/blue.
+#      Index 40 is the same brightness with no blue in it at all.
+GREEN = (40, (0, 215, 0))
 AMBER = (220, (255, 215, 0))
 RED = (196, (255, 0, 0))
 
@@ -454,7 +458,7 @@ def collect_limits(data):
 # --------------------------------------------------------------------------
 
 
-def ansi_wrap(text, colour, mode="truecolor"):
+def ansi_wrap(text, colour, mode="256"):
     if colour is None:
         return text
     index, (red, green, blue) = colour
@@ -518,7 +522,8 @@ def render(data, plan, config, age=None, error=None, backoff_until=0):
     # Menu bar: "S:46% (3h39m) W:7% (5d0h)". Each limit's percentage is tinted
     # on its own, so you can see at a glance *which* one is the tight one.
     use_color = bool(config.get("color", True))
-    mode = config.get("color_mode", "truecolor")
+    # 256-index only: SwiftBar silently drops truecolor sequences.
+    mode = config.get("color_mode", "256")
     chips = []
     for row in rows:
         percent = f"{round(row['percent'])}%"
