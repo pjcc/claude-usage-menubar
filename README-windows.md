@@ -51,30 +51,24 @@ with Windows from then on.
 
 ## Getting it out of the overflow
 
-New tray icons go into the overflow flyout behind the `^` chevron. Three ways out,
-in order of reliability:
+New tray icons go into the overflow flyout behind the `^` chevron. Use **Always show
+on taskbar** in the right-click menu, which moves it immediately and both ways.
+Dragging it out of the flyout by hand, or Settings > Personalisation > Taskbar >
+Other system tray icons, do the same thing.
 
-1. **Drag it** from the flyout onto the taskbar. Instant, and it stays
-2. **Settings > Personalisation > Taskbar > Other system tray icons**, and switch
-   *Claude Usage* on
-3. **Always show on taskbar** in the right-click menu
+The one case the menu item cannot handle is a first run. `Shell_NotifyIcon` has no
+"always show me" flag, deliberately, so that installers cannot claim a permanent
+slot. What Windows 11 has instead is one `IsPromoted` DWORD per icon under
+`HKCU\Control Panel\NotifyIconSettings`, which is what the Settings toggle writes and
+what the menu item sets. That entry does not exist until the shell has filed the icon,
+which it does on its own schedule some minutes after the icon first appears. Until
+then there is nothing to set, so the menu item says so and opens taskbar settings
+instead.
 
-Option 3 is a convenience, and it comes with caveats worth knowing.
-`Shell_NotifyIcon` has no "always show me" flag, deliberately, so that installers
-cannot claim a permanent slot. What Windows 11 does have is one `IsPromoted` DWORD
-per icon under `HKCU\Control Panel\NotifyIconSettings`, which is exactly what the
-Settings toggle writes, and that is what the menu item sets.
-
-Two things follow from Explorer owning that key:
-
-- the entry does not exist until the shell has filed the icon, which can take a few
-  minutes after first run. Before then the menu item reports that and does nothing
-- Explorer caches the setting, so it may not take effect until you sign out and back
-  in
-
-So the honest answer is that the program *can* do it, but option 1 or 2 gets you
-there in one action and this one might not. It is there for scripting a fresh
-machine, where signing in again is happening anyway.
+Worth knowing if you are reading the code: the shell reads that setting when an icon
+is *added*, not while it is live, so writing it alone changes nothing visible. The
+icon is removed and re-added straight afterwards to force the re-read. Without that
+the setting sits there until the next sign-in.
 
 ## The menu
 
@@ -88,7 +82,7 @@ machine, where signing in again is happening anyway.
 |---|---|---|
 | Show weekly in icon | off | Adds the tightest weekly limit as a second row. Off keeps the session figure at full height, which is roughly double the glyph size |
 | Colour in icon | on | Off means no colour at all, not a different colour: the digits take whichever plain tone contrasts with the taskbar |
-| Always show on taskbar | off | See above |
+| Always show on taskbar | off | Moves it out of the overflow flyout and back. Reflects the same setting as Windows' own toggle, so changing it there shows up here |
 | Open at login | on | An `HKCU\...\Run` value pointing at `pythonw.exe`. No console flash, no shortcut file |
 
 The menu follows the system light/dark setting and re-themes itself if you change it

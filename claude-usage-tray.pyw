@@ -963,6 +963,19 @@ class Tray:
             data.dwInfoFlags = info_icon
         return shell32.Shell_NotifyIconW(action, ctypes.byref(data))
 
+    def readd(self):
+        """Remove and re-add the icon.
+
+        The shell reads the taskbar-vs-overflow setting when an icon is
+        added, not while it is live, so writing IsPromoted on its own changes
+        nothing visible until something re-registers -- which otherwise means
+        waiting for the next sign-in. Re-adding is instant and costs a single
+        frame of flicker.
+        """
+        self.notify(NIM_DELETE)
+        self.notify(NIM_ADD, icon=self.icon, tip=APP_NAME)
+        self.refresh_display()
+
     def balloon(self, text, warning=False):
         """The only channel for one-off feedback: the menu is gone by the time
         an action runs, and a message box would steal focus."""
@@ -1199,17 +1212,19 @@ class Tray:
             disable_login() if login_enabled() else enable_login()
         elif ident == ID_PIN:
             want = not pinned()
-            if not set_pinned(want):
+            if set_pinned(want):
+                self.readd()
+            else:
+                # No entry means the shell has not filed the icon yet, which
+                # it does on its own schedule after a first run. Nothing here
+                # can force that, so hand over to the tool that can.
                 self.balloon(
-                    "Windows has not filed this icon yet. Try again in a "
-                    "moment, or drag it out of the overflow by hand.",
+                    "Windows has not registered this icon yet. Opening "
+                    "taskbar settings -- switch on 'Claude Usage' there, or "
+                    "drag the icon out of the overflow.",
                     warning=True,
                 )
-            elif want:
-                self.balloon(
-                    "Pinned to the taskbar. If it stays in the overflow, "
-                    "sign out and back in -- Explorer caches the setting."
-                )
+                os.startfile("ms-settings:taskbar")
         elif ident == ID_QUIT:
             user32.DestroyWindow(self.hwnd)
             return
