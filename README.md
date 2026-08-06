@@ -50,11 +50,22 @@ separate:
   countdown tick in seconds
 - the network is touched **at most once a minute**, and only when not already backing
   off
-- failures back off **exponentially**: 60s, doubling per consecutive failure, capped at
-  one hour. A server `retry-after` is honoured only when it asks for longer than that
+- failures back off **exponentially**: 60s, doubling per consecutive failure. The
+  ceiling depends on who failed. A server that answered gets **one hour**, and its
+  `retry-after` is honoured when it asks for longer than that. A failure on this
+  machine - no DNS, no route, a timeout - never reached the server, so nobody asked
+  us to stay away: those cap at **five minutes**
+- **a hand-driven refresh clears our own backoff.** It exists to spare the network, and
+  you have just overruled it. Only a wait the server actually asked for survives, and
+  the refresh says so rather than declining in silence
+- recovery is **triggered, not just waited out**. Waking from sleep resets the penalty
+  outright, and a usage window that ended while we were offline holds it down to the
+  ordinary poll interval
 - reset countdowns are recomputed **locally** on every render, so they stay accurate
   between polls
-- percentages come from cache, and are flagged once genuinely stale
+- percentages come from cache, and are flagged once genuinely stale. If a window rolled
+  over while we could not reach the API, the figure counts a window nobody is in any
+  more, so it is replaced by `--` rather than shown or guessed at as zero
 
 ### Hardening
 
