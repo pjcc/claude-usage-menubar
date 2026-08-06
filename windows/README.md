@@ -1,8 +1,11 @@
 # claude-usage-tray (Windows)
 
-The Windows counterpart to the macOS menu-bar plugin. Your Claude session usage,
-drawn into the notification-area icon so it is visible without opening settings or
-running `/usage`.
+Your Claude session usage, drawn into the notification-area icon so it is visible
+without opening settings or running `/usage`.
+
+For what it is, how it refreshes and how it is hardened, see the
+**[root README](../README.md)**. This file covers the Windows build only. The macOS
+counterpart is in [`../macos/`](../macos/).
 
 ```
 ┌────┐
@@ -14,16 +17,8 @@ The figure is tinted green, amber or red by how much is left. Hovering gives the
 full breakdown; right-clicking gives reset times, extra-usage credit spend, and the
 settings.
 
-## Why it is an icon and not text
-
-The macOS build writes `S:41% (1h52m) W:23% (4d06h)` straight into the menu bar.
-Windows 11 has no equivalent: the notification area takes a 16x16 icon and nothing
-else, and the deskband API that once allowed text in the taskbar was removed. So the
-percentage is rendered *as pixels* into the icon, and the text you would have read in
-the menu bar lives in the tooltip and the menu instead.
-
-That is the only significant design difference. The data layer, the throttle, the
-backoff and the cache shape are the same as the Mac build.
+Only the presentation differs from the macOS build: the data layer, the throttle, the
+backoff and the cache shape are the same.
 
 ## Requirements
 
@@ -104,7 +99,7 @@ One uninterrupted first section, everything to do with the current reading:
 | Session / Weekly / Extra credits | Percentages, full reset times, credit spend |
 | Percentages as of, Plan | Provenance of the figures above |
 | Open usage settings | The real page on claude.ai |
-| **Refresh now** | Forces a poll, bypassing the local throttle but still respecting a server-imposed backoff |
+| Refresh now | Forces a poll, bypassing the local throttle but still respecting a server-imposed backoff |
 
 Then a divider, the settings below, and Quit at the foot.
 
@@ -118,33 +113,11 @@ Then a divider, the settings below, and Quit at the foot.
 The menu follows the system light/dark setting and re-themes itself if you change it
 while it is running.
 
-## How it works
+When the endpoint fails or changes shape the icon shows a dim `--` with the reason in
+the menu, rather than disappearing. Fetches run on a worker thread, so a slow request
+never freezes the tray.
 
-It calls `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token, which
-is the same endpoint Claude Code's `/usage` command uses.
-
-**That endpoint is internal and undocumented.** It works today and could change or be
-withdrawn without notice. If that happens the icon shows a dim `--` with the reason in
-the menu rather than disappearing.
-
-### Refresh: 10s on screen, at most once a minute on the wire
-
-The endpoint rate-limits hard. Around a dozen calls in a few minutes earns an HTTP
-429, and it has been observed returning `retry-after: 0` while still refusing, so that
-header cannot be trusted as guidance on its own. Rendering and fetching are therefore
-separate:
-
-- the icon and tooltip re-render every **10s**. This is display only, costs no
-  network, and lets the retry countdown tick in seconds
-- the network is touched **at most once a minute**, and only when not already backing
-  off. Fetches run on a worker thread so a slow request never freezes the tray
-- failures back off **exponentially**: 60s, doubling per consecutive failure, capped
-  at one hour. A server `retry-after` is honoured only when it asks for longer
-- reset countdowns are recomputed **locally** on every render, so they stay accurate
-  between polls
-- percentages come from cache, and are marked stale in the tooltip once genuinely old
-
-### Rendering digits into an icon
+## Rendering digits into an icon
 
 GDI text drawing does not write an alpha channel, so painting coloured text onto a
 transparent bitmap produces fully transparent, invisible glyphs. The way round it is
@@ -165,26 +138,24 @@ The glyphs are fitted to the digits' *ink* height rather than the font's line bo
 which carries ascent, descent and internal leading that no digit occupies. Sizing to
 the line box wastes roughly a third of a 16px icon.
 
-### Hardening
+## Notes
 
-- everything reaching the tooltip or a menu label from the API passes through
-  `sanitize()`, which strips control characters that would otherwise truncate a
-  tooltip or corrupt a label
-- anything resembling a token is redacted from cached and displayed error text
-- state files are written atomically, with the PID in the temp name, because a forced
-  refresh and the scheduled poll can be in flight at once
+Beyond the shared hardening in the [root README](../README.md), two things are
+specific to this build:
+
 - a named mutex prevents a second instance, which would add a second icon and double
   the polling into the rate limit the throttle exists to avoid
-- no shell is ever invoked
+- server strings reaching a tooltip or menu label are stripped of control characters,
+  which would otherwise truncate a tooltip or corrupt a label. There is no `|` to
+  escape here: unlike SwiftBar, a Win32 menu item's action is the integer passed when
+  it is created, not something parsed back out of its text
 
-### Notes
+Also worth knowing:
 
 - the popup menu is themed via two undocumented `uxtheme.dll` exports, available by
   ordinal only (135 `SetPreferredAppMode`, 136 `FlushMenuThemes`). It is how most apps
   get dark context menus, but it is undocumented all the same, so it is guarded: if a
   future build withdraws them the menu simply comes up light
-- limits are read generically from the API's `limits` array, so model-specific caps
-  such as a weekly Opus limit appear as extra rows with no code change
 - the icon is re-added if Explorer restarts
 
 ## Files

@@ -60,18 +60,17 @@ STATUSLINE_PATH = os.path.join(STATE_DIR, "statusline")
 COLOR_WARN_AT = 50
 COLOR_ALERT_AT = 80
 
-# (xterm-256 index, rgb).
-#
-# Two things learned the hard way here:
+# xterm-256 indices. Two things learned the hard way here:
 #   1. SwiftBar does NOT support 24-bit truecolor (`38;2;r;g;b`). It drops the
 #      sequence silently, so the text renders with no colour at all rather than
-#      falling back. 256-index (`38;5;n`) is the only form that works.
+#      falling back. 256-index (`38;5;n`) is the only form that works, which is
+#      why there is no rgb pair here to fall back to.
 #   2. The statusline's green is index 42 = rgb(0,215,135), whose blue channel is
 #      135. In a terminal that reads green; in the menu bar it reads teal/blue.
 #      Index 40 is the same brightness with no blue in it at all.
-GREEN = (40, (0, 215, 0))
-AMBER = (220, (255, 215, 0))
-RED = (196, (255, 0, 0))
+GREEN = 40
+AMBER = 220
+RED = 196
 
 # The usage endpoint rate-limits aggressively (observed: HTTP 429 with
 # retry-after ~275s after roughly a dozen calls). So the plugin's refresh
@@ -80,7 +79,6 @@ RED = (196, (255, 0, 0))
 # touched at most once a minute and backs off when told to.
 MIN_FETCH_SECONDS = 60
 STALE_AFTER_SECONDS = 150
-DEFAULT_BACKOFF_SECONDS = 300
 MAX_BACKOFF_SECONDS = 3600
 
 LOGIN_LABEL = "com.ameba.SwiftBar"
@@ -366,6 +364,23 @@ def credentials():
     return oauth["accessToken"], oauth.get("subscriptionType") or ""
 
 
+class RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect from the usage endpoint.
+
+    urllib carries the original headers to the new location, so a 3xx would
+    replay the bearer token at whatever host it named, with no same-origin
+    check of its own. This endpoint has no reason to redirect, so treat one
+    as the anomaly it would be: returning None turns it into an HTTPError,
+    which the caller already handles by backing off.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(RefuseRedirect)
+
+
 def fetch(access_token):
     request = urllib.request.Request(
         USAGE_URL,
@@ -375,7 +390,7 @@ def fetch(access_token):
             "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+    with OPENER.open(request, timeout=TIMEOUT) as response:
         return json.load(response)
 
 
@@ -497,13 +512,10 @@ def collect_limits(data):
 # --------------------------------------------------------------------------
 
 
-def ansi_wrap(text, colour, mode="256"):
-    if colour is None:
+def ansi_wrap(text, index):
+    if index is None:
         return text
-    index, (red, green, blue) = colour
-    if mode == "256":
-        return f"\033[38;5;{index}m{text}\033[0m"
-    return f"\033[38;2;{red};{green};{blue}m{text}\033[0m"
+    return f"\033[38;5;{index}m{text}\033[0m"
 
 
 def alert_code(percent, severity="normal"):
@@ -561,15 +573,11 @@ def render(data, plan, config, age=None, error=None, backoff_until=0):
     # Menu bar: "S:46% (3h39m) W:7% (5d0h)". Each limit's percentage is tinted
     # on its own, so you can see at a glance *which* one is the tight one.
     use_color = bool(config.get("color", True))
-    # 256-index only: SwiftBar silently drops truecolor sequences.
-    mode = config.get("color_mode", "256")
     chips = []
     for row in rows:
         percent = f"{round(row['percent'])}%"
         if use_color:
-            percent = ansi_wrap(
-                percent, alert_code(row["percent"], row["severity"]), mode
-            )
+            percent = ansi_wrap(percent, alert_code(row["percent"], row["severity"]))
         chip = f"{row['tag']}:{percent}"
         span = compact_duration(seconds_until(row["resets_at"]))
         if span:
@@ -584,7 +592,6 @@ def render(data, plan, config, age=None, error=None, backoff_until=0):
                     alert_code(
                         spend.get("percent") or 0, spend.get("severity") or "normal"
                     ),
-                    mode,
                 )
             chips.append(chip)
 
@@ -635,11 +642,7 @@ def render(data, plan, config, age=None, error=None, backoff_until=0):
     line = status_line(error, backoff_until)
     if line:
         print(f"⚠ {sanitize(redact(line), limit=120)} | {DIM}")
-    print(
-        f"Refresh now | bash=\"{SELF}\" param1=--force-refresh "
-        f"terminal=false refresh=true"
-    )
-    print(f"Open usage settings | href={SETTINGS_URL}")
+    print_footer()
 
 
 def toggle_line(label, enabled, action):
@@ -650,6 +653,16 @@ def toggle_line(label, enabled, action):
         f"{mark} {label} | bash=\"{SELF}\" "
         f"param1={action} terminal=false refresh=true"
     )
+
+
+def print_footer():
+    """Closes both the normal dropdown and the failed one, which is the point:
+    when it has failed is exactly when you want to refresh or go and look."""
+    print(
+        f"Refresh now | bash=\"{SELF}\" param1=--force-refresh "
+        f"terminal=false refresh=true"
+    )
+    print(f"Open usage settings | href={SETTINGS_URL}")
 
 
 def print_controls(config):
@@ -668,11 +681,7 @@ def fail(detail, config, backoff_until=0):
     print("---")
     print_controls(config)
     print("---")
-    print(
-        f"Refresh now | bash=\"{SELF}\" param1=--force-refresh "
-        f"terminal=false refresh=true"
-    )
-    print(f"Open usage settings | href={SETTINGS_URL}")
+    print_footer()
 
 
 def main():

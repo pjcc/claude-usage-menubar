@@ -207,11 +207,6 @@ def write_statusline_sidecar(data):
 
 
 # --------------------------------------------------------------------------
-# launch at login
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
 # our own name in Windows' lists
 # --------------------------------------------------------------------------
 
@@ -365,6 +360,11 @@ def relaunch_branded():
     except OSError:
         return False
     return True
+
+
+# --------------------------------------------------------------------------
+# launch at login
+# --------------------------------------------------------------------------
 
 
 def pythonw():
@@ -526,6 +526,23 @@ def credentials():
     return token, oauth.get("subscriptionType") or ""
 
 
+class RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect from the usage endpoint.
+
+    urllib carries the original headers to the new location, so a 3xx would
+    replay the bearer token at whatever host it named, with no same-origin
+    check of its own. This endpoint has no reason to redirect, so treat one
+    as the anomaly it would be: returning None turns it into an HTTPError,
+    which the caller already handles by backing off.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(RefuseRedirect)
+
+
 def fetch(access_token):
     request = urllib.request.Request(
         USAGE_URL,
@@ -535,7 +552,7 @@ def fetch(access_token):
             "Accept": "application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+    with OPENER.open(request, timeout=TIMEOUT) as response:
         return json.load(response)
 
 
@@ -873,6 +890,9 @@ gdi32.CreateDIBSection.argtypes = [
     ctypes.POINTER(ctypes.c_void_p), w.HANDLE, w.DWORD,
 ]
 gdi32.CreateBitmap.restype = w.HBITMAP
+gdi32.CreateBitmap.argtypes = [
+    ctypes.c_int, ctypes.c_int, w.UINT, w.UINT, w.LPVOID,
+]
 gdi32.CreateFontW.restype = w.HFONT
 gdi32.CreateFontW.argtypes = [ctypes.c_int] * 5 + [w.DWORD] * 8 + [w.LPCWSTR]
 gdi32.SelectObject.restype = w.HGDIOBJ
@@ -1429,6 +1449,22 @@ class Tray:
     # -- message loop -----------------------------------------------------
 
     def on_message(self, hwnd, message, wparam, lparam):
+        """Callback boundary. Nothing may escape from here.
+
+        An exception raised inside a ctypes callback has nowhere to go: under
+        pythonw there is no console to print it to, and the tray would just
+        stop responding with no sign of why. Since the API shape is
+        undocumented and could change under us, the one guarantee worth
+        keeping is the one the rest of the file already makes -- degrade to a
+        placeholder rather than die -- and this is the last place it can
+        still be kept.
+        """
+        try:
+            return self.dispatch(hwnd, message, wparam, lparam)
+        except Exception:  # noqa: BLE001
+            return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+    def dispatch(self, hwnd, message, wparam, lparam):
         if message == self.taskbar_created:
             # Explorer restarted and forgot every tray icon; re-add ours.
             self.notify(NIM_ADD, icon=self.icon, tip=self.tooltip())
