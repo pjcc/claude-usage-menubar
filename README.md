@@ -3,6 +3,9 @@
 Your Claude session and weekly usage limits, always visible in the macOS menu bar,
 so you don't have to open settings or run `/usage` to find out how much you have left.
 
+On Windows, see **[README-windows.md](README-windows.md)** and
+`claude-usage-tray.pyw`, which puts the same figures in the notification area.
+
 ```
 S:41% (1h52m) W:23% (4d06h)
 └ session, 41% used, resets in 1h52m
