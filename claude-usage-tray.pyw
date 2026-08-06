@@ -1336,16 +1336,12 @@ class Tray:
         if not rows:
             user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, "No usage data yet")
 
-        # Refresh and the provenance of the figures sit directly under the
-        # figures they describe: "as of" only means something next to the
-        # number it qualifies, and the action you would take about a stale
-        # one is right there with it. Settings that change behaviour rather
-        # than report it come after.
-        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING, ID_REFRESH, "Refresh now")
-        plan = sanitize(self.cache.get("plan") or "", limit=24)
-        if plan:
-            user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, f"Plan: {plan.capitalize()}")
+        # Provenance stays with the figures it qualifies -- "as of" means
+        # nothing away from the number it dates -- and the two things you
+        # would do about a figure you distrust, open the real page or fetch
+        # again, close the same block. One uninterrupted section: it is all
+        # about the current reading. Settings, which change behaviour rather
+        # than report it, are the separate concern below the divider.
         age = self.age()
         if age is None:
             stamp = "No successful fetch yet"
@@ -1354,12 +1350,17 @@ class Tray:
             suffix = f" ({compact_duration(int(age))} ago)" if age > STALE_AFTER_SECONDS else ""
             stamp = f"Percentages as of {when:%H:%M:%S}{suffix}"
         user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, stamp)
+        plan = sanitize(self.cache.get("plan") or "", limit=24)
+        if plan:
+            user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, f"Plan: {plan.capitalize()}")
         detail = status_line(self.cache.get("error"), self.cache.get("backoff_until", 0))
         if detail:
             user32.AppendMenuW(
                 menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
                 sanitize(redact(f"⚠ {detail}"), limit=120),
             )
+        user32.AppendMenuW(menu, MF_STRING, ID_SETTINGS, "Open usage settings")
+        user32.AppendMenuW(menu, MF_STRING, ID_REFRESH, "Refresh now")
 
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         for label, enabled, ident in (
@@ -1373,7 +1374,6 @@ class Tray:
             )
 
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING, ID_SETTINGS, "Open usage settings")
         user32.AppendMenuW(menu, MF_STRING, ID_QUIT, "Quit")
 
         point = w.POINT()

@@ -97,11 +97,16 @@ Set `"brand": false` in `config.json` to skip it and run under `pythonw.exe`.
 
 ## The menu
 
+One uninterrupted first section, everything to do with the current reading:
+
 | Row | |
 |---|---|
 | Session / Weekly / Extra credits | Percentages, full reset times, credit spend |
+| Percentages as of, Plan | Provenance of the figures above |
+| Open usage settings | The real page on claude.ai |
 | **Refresh now** | Forces a poll, bypassing the local throttle but still respecting a server-imposed backoff |
-| Plan, Percentages as of | Provenance of the figures above |
+
+Then a divider, the settings below, and Quit at the foot.
 
 | Toggle | Default | Effect |
 |---|---|---|
