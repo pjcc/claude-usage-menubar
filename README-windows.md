@@ -70,6 +70,31 @@ is *added*, not while it is live, so writing it alone changes nothing visible. T
 icon is removed and re-added straight afterwards to force the re-read. Without that
 the setting sits there until the next sign-in.
 
+The setting is also keyed to the executable, so it would be lost the first time the
+launcher below is rebuilt. It is recorded in `config.json` too and reapplied on
+startup when the shell has no record of it.
+
+## Why it runs as ClaudeUsage.exe
+
+Windows names a tray icon in **Settings > Taskbar** after the *executable's*
+`FileDescription`. Nothing the icon supplies changes that: the tooltip is ignored.
+Run under `pythonw.exe` and you are listed as **Python**, indistinguishable from any
+other Python tray app, and Task Manager's Startup tab says the same.
+
+So on first run it copies the interpreter to
+`%LOCALAPPDATA%\claude-usage-tray\ClaudeUsage.exe`, rewrites its version resource to
+say *Claude Usage*, and restarts under it. A copied CPython cannot find its
+installation by itself, but the two-line `pyvenv.cfg` beside it is all it needs: the
+same mechanism a virtual environment uses to point at its base, without the
+environment. It is about 90KB, and it is rebuilt if the interpreter it was copied
+from moves or is upgraded.
+
+All of it is stdlib: `BeginUpdateResourceW`/`UpdateResourceW` through `ctypes`, and a
+`VS_VERSIONINFO` block assembled by hand. Nothing is compiled and the real
+interpreter is never touched.
+
+Set `"brand": false` in `config.json` to skip it and run under `pythonw.exe`.
+
 ## The menu
 
 | Row | |
@@ -164,8 +189,9 @@ the line box wastes roughly a third of a 16px icon.
 | `%LOCALAPPDATA%\claude-usage-tray\config.json` | Settings |
 | `%LOCALAPPDATA%\claude-usage-tray\cache.json` | Cached usage, backoff state |
 | `%LOCALAPPDATA%\claude-usage-tray\statusline` | One-line sidecar for a Claude Code statusline that wants the credit figure without a network call |
+| `%LOCALAPPDATA%\claude-usage-tray\ClaudeUsage.exe`, `pyvenv.cfg` | The rebranded interpreter it runs under, see above |
 
-Deleting any of them is safe; they are rebuilt on the next poll.
+Deleting any of them is safe; they are rebuilt on the next poll or the next start.
 
 ## Uninstall
 

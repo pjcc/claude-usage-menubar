@@ -31,6 +31,9 @@ import ctypes.wintypes as w
 import json
 import os
 import re
+import shutil
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -68,6 +71,11 @@ RUN_VALUE = "ClaudeUsageTray"
 # in the overflow flyout. See promote_icon().
 NOTIFY_ICON_KEY = r"Control Panel\NotifyIconSettings"
 ICON_UID = 1
+
+# A rebranded copy of the interpreter. See build_launcher() for why running
+# under pythonw.exe is not good enough.
+LAUNCHER_EXE = os.path.join(STATE_DIR, "ClaudeUsage.exe")
+LAUNCHER_CFG = os.path.join(STATE_DIR, "pyvenv.cfg")
 
 # Percent-of-limit thresholds, mirroring the Mac build and the Claude Code
 # statusline so the same figure reads the same everywhere.
@@ -203,26 +211,194 @@ def write_statusline_sidecar(data):
 # --------------------------------------------------------------------------
 
 
-def pythonw():
-    """Prefer pythonw.exe so a login launch never flashes a console."""
-    windowless = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-    return windowless if os.path.exists(windowless) else sys.executable
+# --------------------------------------------------------------------------
+# our own name in Windows' lists
+# --------------------------------------------------------------------------
 
 
-def login_enabled():
+def pad4(data):
+    return data + b"\x00" * (-len(data) % 4)
+
+
+def version_node(key, value, kind, children=b""):
+    """One VS_VERSIONINFO node. kind 1 is text, 0 is binary.
+
+    The length field counts characters for text and bytes for binary, and
+    every node is padded to a 4-byte boundary before its value and before its
+    children. Get either wrong and Windows reports no version info at all
+    rather than complaining.
+    """
+    if kind == 1:
+        payload = (value + "\x00").encode("utf-16-le") if value else b""
+        measure = len(payload) // 2
+    else:
+        payload = value
+        measure = len(payload)
+    body = struct.pack("<HHH", 0, measure, kind)
+    body += (key + "\x00").encode("utf-16-le")
+    body = pad4(body) + payload
+    body = pad4(body) + children
+    return struct.pack("<H", len(body)) + body[2:]
+
+
+def version_resource(strings):
+    fixed = struct.pack(
+        "<LLLLLLLLLLLLL",
+        0xFEEF04BD,  # signature
+        0x00010000,  # struct version
+        0x00010000, 0,  # file version 1.0.0.0
+        0x00010000, 0,  # product version
+        0x3F, 0,  # flags mask, flags
+        0x00000004,  # VOS__WINDOWS32
+        0x00000001,  # VFT_APP
+        0, 0, 0,
+    )
+    entries = b"".join(pad4(version_node(k, v, 1)) for k, v in strings.items())
+    # 0409 04B0: US English, Unicode.
+    table = version_node("040904B0", "", 1, entries)
+    strings_block = version_node("StringFileInfo", "", 1, pad4(table))
+    translation = version_node("Translation", struct.pack("<HH", 0x0409, 0x04B0), 0)
+    var_block = version_node("VarFileInfo", "", 1, pad4(translation))
+    return version_node(
+        "VS_VERSION_INFO", fixed, 0, pad4(strings_block) + pad4(var_block)
+    )
+
+
+def config_home():
+    """The interpreter our launcher copy is pinned to, or None."""
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-            winreg.QueryValueEx(key, RUN_VALUE)
+        with open(LAUNCHER_CFG, encoding="utf-8") as handle:
+            for line in handle:
+                key, _, value = line.partition("=")
+                if key.strip() == "home":
+                    return value.strip()
+    except OSError:
+        pass
+    return None
+
+
+def build_launcher():
+    """Copy the interpreter under our own name and rebrand it. True on success.
+
+    Windows names a tray icon in Settings > Taskbar after the *executable's*
+    FileDescription, and nothing the icon itself supplies changes that -- the
+    tooltip is ignored. Run under pythonw.exe and you are listed as "Python",
+    indistinguishable from every other Python tray app. The same string names
+    us in Task Manager's Startup tab, which matters more, since we put
+    ourselves there.
+
+    So the interpreter is copied next to our state and its version resource
+    rewritten. A copied CPython cannot find its installation by itself, but a
+    two-line pyvenv.cfg is all it needs: the mechanism a virtual environment
+    uses to point at its base, without the environment.
+
+    Rebuilt whenever the interpreter it was copied from moves or is upgraded,
+    since the copy is then pointing at a directory that may no longer exist.
+    """
+    source = os.path.join(sys.base_prefix, "pythonw.exe")
+    if not os.path.exists(source):
+        return False
+    if os.path.exists(LAUNCHER_EXE) and config_home() == sys.base_prefix:
+        return True
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        # Not written in place: the running copy is locked, and a half-copied
+        # launcher is worse than none.
+        staging = f"{LAUNCHER_EXE}.{os.getpid()}.tmp"
+        shutil.copy2(source, staging)
+        if not write_version_info(staging):
+            os.remove(staging)
+            return False
+        with open(LAUNCHER_CFG, "w", encoding="utf-8") as handle:
+            handle.write(f"home = {sys.base_prefix}\ninclude-system-site-packages = true\n")
+        os.replace(staging, LAUNCHER_EXE)
         return True
     except OSError:
         return False
 
 
+def write_version_info(path):
+    blob = version_resource(
+        {
+            "CompanyName": "",
+            "FileDescription": APP_NAME,
+            "FileVersion": "1.0.0.0",
+            "InternalName": "ClaudeUsage",
+            "OriginalFilename": "ClaudeUsage.exe",
+            "ProductName": APP_NAME,
+            "ProductVersion": "1.0.0.0",
+        }
+    )
+    handle = kernel32.BeginUpdateResourceW(path, False)
+    if not handle:
+        return False
+    RT_VERSION = 16
+    ok = kernel32.UpdateResourceW(
+        handle,
+        ctypes.cast(RT_VERSION, w.LPCWSTR),
+        ctypes.cast(1, w.LPCWSTR),
+        0x0409,
+        blob,
+        len(blob),
+    )
+    return bool(kernel32.EndUpdateResourceW(handle, not ok) and ok)
+
+
+def relaunch_branded():
+    """Hand over to the rebranded launcher. True if we did, and should exit.
+
+    Deliberately before the single-instance mutex is taken, so the child does
+    not find it already held.
+    """
+    if read_json(CONFIG_PATH).get("brand") is False:
+        return False
+    if os.path.normcase(sys.executable) == os.path.normcase(LAUNCHER_EXE):
+        return False
+    if not build_launcher():
+        return False
+    try:
+        subprocess.Popen(
+            [LAUNCHER_EXE, SELF],
+            close_fds=True,
+            creationflags=subprocess.DETACHED_PROCESS,
+        )
+    except OSError:
+        return False
+    return True
+
+
+def pythonw():
+    """The executable to register for login.
+
+    Whatever we are actually running under, except that a console
+    interpreter is swapped for its windowless twin so a login launch never
+    flashes a black box.
+    """
+    if os.path.basename(sys.executable).lower() != "python.exe":
+        return sys.executable
+    windowless = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return windowless if os.path.exists(windowless) else sys.executable
+
+
+def login_command():
+    return f'"{pythonw()}" "{SELF}"'
+
+
+def login_value():
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            return winreg.QueryValueEx(key, RUN_VALUE)[0]
+    except OSError:
+        return None
+
+
+def login_enabled():
+    return login_value() is not None
+
+
 def enable_login():
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-        winreg.SetValueEx(
-            key, RUN_VALUE, 0, winreg.REG_SZ, f'"{pythonw()}" "{SELF}"'
-        )
+        winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, login_command())
 
 
 def disable_login():
@@ -260,7 +436,9 @@ def icon_settings_key():
     Returns None until the shell has actually seen the icon, which is why
     promotion is an action you invoke rather than something done at startup.
     """
-    executable = os.path.normcase(pythonw())
+    # sys.executable, not the login launcher: this has to match whatever the
+    # shell actually saw register the icon, which is the process we are in.
+    executable = os.path.normcase(sys.executable)
     try:
         root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, NOTIFY_ICON_KEY)
     except OSError:
@@ -730,6 +908,14 @@ kernel32.GetModuleHandleW.restype = w.HMODULE
 kernel32.GetModuleHandleW.argtypes = [w.LPCWSTR]
 kernel32.CreateMutexW.restype = w.HANDLE
 kernel32.CreateMutexW.argtypes = [w.LPVOID, w.BOOL, w.LPCWSTR]
+kernel32.BeginUpdateResourceW.restype = w.HANDLE
+kernel32.BeginUpdateResourceW.argtypes = [w.LPCWSTR, w.BOOL]
+kernel32.UpdateResourceW.restype = w.BOOL
+kernel32.UpdateResourceW.argtypes = [
+    w.HANDLE, w.LPCWSTR, w.LPCWSTR, w.WORD, w.LPVOID, w.DWORD,
+]
+kernel32.EndUpdateResourceW.restype = w.BOOL
+kernel32.EndUpdateResourceW.argtypes = [w.HANDLE, w.BOOL]
 
 _FONTS = {}
 
@@ -917,6 +1103,11 @@ class Tray:
                 enable_login()
             self.config["login_initialised"] = True
             write_json(CONFIG_PATH, self.config)
+        # Keep the login entry pointing at whatever we now run as. The first
+        # start after the branded launcher appears is still under pythonw.exe,
+        # and a stale command would keep starting us under the old name.
+        if login_enabled() and login_value() != login_command():
+            enable_login()
 
     # -- config -----------------------------------------------------------
 
@@ -1213,6 +1404,11 @@ class Tray:
         elif ident == ID_PIN:
             want = not pinned()
             if set_pinned(want):
+                # Remembered as well as written: the shell keys the setting to
+                # the executable, so it is lost the first time we start under
+                # a rebuilt launcher. Our own copy is what restores it.
+                self.config["pinned"] = want
+                write_json(CONFIG_PATH, self.config)
                 self.readd()
             else:
                 # No entry means the shell has not filed the icon yet, which
@@ -1276,6 +1472,11 @@ class Tray:
         self.notify(NIM_ADD, icon=self.icon, tip=APP_NAME)
         self.maybe_fetch()
         self.refresh_display()
+        # Restore the taskbar pin if the shell has no record of it. Its
+        # record is per executable, so the first start under a rebuilt
+        # launcher begins in the overflow however deliberately it was pinned.
+        if self.option("pinned", False) and not pinned() and set_pinned(True):
+            self.readd()
         # 10s, matching the Mac build's filename-driven cadence: it costs no
         # network and lets the retry countdown tick in seconds.
         user32.SetTimer(self.hwnd, 1, 10000, None)
@@ -1301,6 +1502,11 @@ def main():
             user32.SetProcessDPIAware()
         except (AttributeError, OSError):
             pass
+
+    # Restart under our own name before anything else claims resources, so
+    # that Windows lists us as "Claude Usage" rather than "Python".
+    if relaunch_branded():
+        return
 
     # A second instance would add a second icon and double the polling into
     # the rate limit that the whole throttle exists to avoid.
