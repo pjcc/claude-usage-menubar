@@ -77,8 +77,15 @@ RED = 196
 # cadence drives the *display* only -- percentages come from cache and the
 # reset countdowns are recomputed locally on every tick, while the network is
 # touched at most once a minute and backs off when told to.
-MIN_FETCH_SECONDS = 60
-STALE_AFTER_SECONDS = 150
+# Measured 2026-08-07: the endpoint allows five calls, refuses the sixth, and
+# stays shut for 300s. Sustained, that is one call a minute -- which is what
+# this used to poll at, leaving no headroom whatsoever for Claude Code hitting
+# the same endpoint or for anyone touching Refresh now. Two minutes keeps less
+# than half the budget for us and costs nothing: the percentages move slowly
+# and the countdowns beside them are computed locally every ten seconds.
+MIN_FETCH_SECONDS = 120
+# Two missed polls, as before, now that a poll is twice as far apart.
+STALE_AFTER_SECONDS = 300
 # The title flags staleness early because a discreet marker costs nothing.
 # Dropping the colour is louder, so it waits until the age is beyond
 # explaining away by a missed poll or two.

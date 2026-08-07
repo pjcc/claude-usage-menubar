@@ -41,16 +41,27 @@ reason in the menu rather than breaking your menu bar or taskbar.
 
 ### Refresh: 10s on screen, at most once a minute on the wire
 
-The endpoint rate-limits hard. Around a dozen calls in a few minutes earns an HTTP 429.
-Its `retry-after` cannot be trusted in either direction: it has been observed returning
-`0` while still refusing, and observed asking for a full hour and then serving the very
-next request a minute later. It is treated as a hint with a ceiling, never as an
-instruction. Rendering and fetching are therefore separate:
+The endpoint rate-limits hard. Measured on 2026-08-07, twice, with consistent results:
+
+- it serves **5 calls** and refuses the 6th with HTTP 429
+- the refusal lasts **300s**, and `Retry-After: 300` was accurate to within 4 seconds
+- requests made while refused **do not extend** the block
+- so the sustained ceiling is about **one call per minute**
+
+That last figure is the one that matters, because it is also what this used to poll at.
+Claude Code hits the same endpoint, so at 60s there was no headroom at all and a 429
+every few hours was routine. Polling is now every 120s.
+
+`Retry-After` is honoured but never trusted, because it is not always that honest: the
+same endpoint has been seen returning `0` while still refusing, and - after several
+hours of repeated tripping - asking for a full hour and then serving normally 17 minutes
+later. It is treated as a hint with a ceiling. Rendering and fetching are therefore
+separate:
 
 - the display re-renders every **10s**. This costs no network, and lets the retry
   countdown tick in seconds
-- the network is touched **at most once a minute**, and only when not already backing
-  off
+- the network is touched **at most once every two minutes**, and only when not already
+  backing off
 - failures back off **exponentially**: 60s, doubling per consecutive failure. The
   ceiling depends on who failed. A server that answered gets **fifteen minutes**, which
   is also the most that will be taken from a `retry-after`. A failure on this machine -
