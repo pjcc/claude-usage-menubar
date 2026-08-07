@@ -88,10 +88,44 @@ COLOR_ALERT_AT = 80
 GREEN = (0, 215, 0)
 AMBER = (255, 215, 0)
 RED = (255, 0, 0)
+# Nothing to report, and deliberately not one of the alert tones: a figure we
+# cannot vouch for must not be able to render as a healthy green.
+MUTED = (138, 138, 142)
 
-MIN_FETCH_SECONDS = 60
-STALE_AFTER_SECONDS = 150
-MAX_BACKOFF_SECONDS = 3600
+# Measured 2026-08-07: the endpoint allows five calls, refuses the sixth, and
+# stays shut for 300s. Probes at +30s, +60s and +91s were all still refused, so
+# the budget does not trickle back a call at a time -- overshooting costs the
+# remainder of the window outright, which is why the margin matters more than
+# the average rate.
+#
+# 60s spends the entire budget and was what this used to poll at, so a single
+# extra call from anywhere -- a manual refresh, a restart -- locked it out. 90s
+# spends three or four of the five and leaves the rest for you. Faster buys
+# little anyway: the percentages move slowly, and the countdowns beside them
+# are recomputed locally every ten seconds regardless of when we last fetched.
+MIN_FETCH_SECONDS = 90
+# Roughly two missed polls, which is what this has always meant.
+STALE_AFTER_SECONDS = 240
+# The tooltip flags staleness early because you had to hover to read it. The
+# icon is glanced at, so it only dims once the age is beyond explaining away
+# by a missed poll or two -- at which point the figure is not a live reading.
+ICON_STALE_AFTER_SECONDS = 900
+# Two ceilings, because two very different things are being waited out. The
+# longer one is for a server that told us to go away. Our own end failing --
+# no DNS, no route, a timeout -- is nobody asking for anything, and capping
+# those the same way is how a machine that briefly lost its network sits five
+# hours stale with the figures from before it slept.
+#
+# The long ceiling is also the most we will take from a retry-after, because
+# that header is untrustworthy in both directions: observed returning 0 while
+# still refusing, and observed asking for a full hour and then serving the
+# very next request a minute later. Honouring the latter literally is how a
+# widget whose whole job is to be current goes an hour without asking.
+MAX_BACKOFF_SECONDS = 900
+MAX_LOCAL_BACKOFF_SECONDS = 300
+# A 10s timer that has not ticked in two minutes did not run late; the
+# machine was suspended in between.
+RESUME_GAP_SECONDS = 120
 
 SEVERITY_RANK = {"normal": 0, "warning": 1, "critical": 2, "severe": 2}
 TOKEN_PATTERN = re.compile(r"sk-ant-[A-Za-z0-9_-]+")
@@ -492,18 +526,40 @@ def set_pinned(pin):
 def backoff_for(fails, err=None):
     """Seconds to wait after a failed attempt.
 
-    Doubles per consecutive failure. A server retry-after is honoured only
-    when it asks for *longer*: the endpoint has been observed returning
-    `retry-after: 0` while still refusing, and obeying that literally means
-    retrying immediately and forever, which keeps the limit tripped.
+    Doubles per consecutive failure, but the ceiling depends on who failed.
+    `err` present means the server answered, so it gets the long ceiling and
+    its retry-after is honoured -- though only when it asks for *longer*: the
+    endpoint has been observed returning `retry-after: 0` while still
+    refusing, and obeying that literally means retrying immediately and
+    forever, which keeps the limit tripped.
+
+    Everything else -- name resolution, routing, timeouts -- failed on this
+    machine without the request ever leaving it. Nobody asked us to stay
+    away, so those get a ceiling measured in minutes.
     """
     wait = MIN_FETCH_SECONDS * (2 ** min(fails - 1, 8))
-    if err is not None:
-        try:
-            wait = max(wait, int(err.headers.get("retry-after") or 0))
-        except (TypeError, ValueError, AttributeError):
-            pass
+    if err is None:
+        return min(wait, MAX_LOCAL_BACKOFF_SECONDS)
+    try:
+        wait = max(wait, int(err.headers.get("retry-after") or 0))
+    except (TypeError, ValueError, AttributeError):
+        pass
     return min(wait, MAX_BACKOFF_SECONDS)
+
+
+def rolled_over(row, fetched_at):
+    """True when this row's window ended after our last good fetch.
+
+    Not merely 'the reset time has passed': the server can hand back a window
+    that expired moments ago and that reading is still the current truth. It
+    is only when the rollover happened while we were blind that the number on
+    screen describes a window nobody is in any more.
+    """
+    when = parse_ts(row.get("resets_at"))
+    if when is None or not fetched_at:
+        return False
+    reset_at = when.timestamp()
+    return reset_at <= time.time() and fetched_at < reset_at
 
 
 def credentials():
@@ -1108,6 +1164,7 @@ class Tray:
         self.cache = read_json(CACHE_PATH)
         self.lock = threading.Lock()
         self.fetching = False
+        self.last_tick = time.time()
         self.icon = None
         self.hwnd = None
         self.size = max(user32.GetSystemMetrics(49), 16)  # SM_CXSMICON
@@ -1208,7 +1265,7 @@ class Tray:
         """
         rows = collect_limits(self.data() or {})
         if not rows:
-            return [("--", (138, 138, 142))]
+            return [("--", MUTED)]
         session = next((r for r in rows if r["tag"] == "S"), None)
         others = [r for r in rows if r is not session]
         tightest = max(others, key=lambda r: r["percent"], default=None)
@@ -1220,13 +1277,29 @@ class Tray:
             chosen = [session or tightest]
         plain = (255, 255, 255) if not taskbar_is_light() else (0, 0, 0)
         use_colour = self.option("color", True)
-        return [
-            (
-                str(round(r["percent"])),
-                alert_code(r["percent"], r["severity"]) if use_colour else plain,
-            )
-            for r in chosen
-        ]
+        fetched_at = self.fetched_at()
+        age = self.age()
+        stale = age is None or age > ICON_STALE_AFTER_SECONDS
+        out = []
+        for r in chosen:
+            if rolled_over(r, fetched_at):
+                # The window this figure counted has ended. Zero would be the
+                # tempting guess, and the wrong one: it invites you to spend a
+                # session you may have spent already. We do not know, so the
+                # icon says so.
+                out.append(("--", MUTED))
+            elif stale:
+                # Right shape, unknown vintage. Dropping the colour keeps a
+                # figure we cannot vouch for from reading as a healthy green.
+                out.append((str(round(r["percent"])), MUTED))
+            else:
+                out.append(
+                    (
+                        str(round(r["percent"])),
+                        alert_code(r["percent"], r["severity"]) if use_colour else plain,
+                    )
+                )
+        return out
 
     def tooltip(self):
         """szTip caps at 127 characters, so this is the compact shape rather
@@ -1236,7 +1309,11 @@ class Tray:
             detail = status_line(self.cache.get("error"), self.cache.get("backoff_until", 0))
             return sanitize(redact(detail or "no data yet"), limit=127)
         lines = []
+        fetched_at = self.fetched_at()
         for row in collect_limits(data):
+            if rolled_over(row, fetched_at):
+                lines.append(f"{row['label']}  --  awaiting refresh")
+                continue
             span = compact_duration(seconds_until(row["resets_at"]))
             lines.append(
                 f"{row['label']}  {round(row['percent'])}%"
@@ -1269,25 +1346,96 @@ class Tray:
             data = self.cache.get("data")
         return data if isinstance(data, dict) else None
 
-    def age(self):
+    def fetched_at(self):
         with self.lock:
-            fetched_at = self.cache.get("fetched_at", 0)
+            return self.cache.get("fetched_at", 0)
+
+    def age(self):
+        fetched_at = self.fetched_at()
         return time.time() - fetched_at if fetched_at else None
 
+    def clear_local_backoff(self, hard):
+        """Drop the penalty we imposed on ourselves, never the one the server
+        asked for. `hard` wipes the failure count too, for the cases where the
+        conditions that caused those failures are known to have changed."""
+        with self.lock:
+            if time.time() < self.cache.get("server_backoff_until", 0):
+                return
+            if hard:
+                self.cache["fails"] = 0
+                self.cache["backoff_until"] = 0
+            else:
+                self.cache["backoff_until"] = min(
+                    self.cache.get("backoff_until", 0),
+                    self.cache.get("last_attempt", 0) + MIN_FETCH_SECONDS,
+                )
+
+    def check_resume(self):
+        """A 10s timer that has not ticked in two minutes did not run late --
+        the machine was suspended. Waking is the one moment the figures are
+        guaranteed to have moved on without us, and whatever failed before the
+        suspend was judging a network that no longer exists, so the doubling
+        starts again from scratch rather than carrying an hour of penalty
+        across a sleep that may have lasted all afternoon.
+        """
+        now = time.time()
+        gap = now - self.last_tick
+        self.last_tick = now
+        if gap > RESUME_GAP_SECONDS:
+            self.clear_local_backoff(hard=True)
+
+    def check_rollover(self):
+        """A window that ended while we were blind is the one case where
+        sitting out a backoff achieves nothing: the number on screen counts a
+        window nobody is in, and no amount of waiting improves it. Hold our own
+        penalty down to the ordinary poll interval until a fetch lands."""
+        fetched_at = self.fetched_at()
+        rows = collect_limits(self.data() or {})
+        if any(rolled_over(row, fetched_at) for row in rows):
+            self.clear_local_backoff(hard=False)
+
     def maybe_fetch(self, force=False):
+        """Starts a fetch if one is due.
+
+        Returns None when it started one, or a short reason when it did not,
+        so a hand-driven refresh can say why nothing happened instead of
+        looking ignored.
+        """
         now = time.time()
         with self.lock:
+            # The only bar a forced refresh cannot clear, and not a policy: a
+            # second request cannot start while the first is still open
+            # without racing it for the cache.
             if self.fetching:
-                return
-            due = force or now - self.cache.get("last_attempt", 0) >= MIN_FETCH_SECONDS
-            # Deliberately still honoured on a forced refresh: if the server
-            # said wait, we wait.
-            blocked = now < self.cache.get("backoff_until", 0)
-            if not due or blocked:
-                return
-            self.fetching = True
-            self.cache["last_attempt"] = now
+                return "A refresh is already running."
+            # Everything below paces our *polling*. Someone clicking Refresh
+            # now is overruling exactly that, so none of it applies to them.
+            # There is no floor on top: a popup menu cannot auto-repeat, the
+            # sustained load is the once-a-minute poll rather than a person
+            # clicking, and rate-limiting the control whose whole purpose is
+            # to override a rate limit is how this went wrong twice already.
+            if force:
+                self.fetching = True
+                self.cache["last_attempt"] = now
+            else:
+                if now - self.cache.get("last_attempt", 0) < MIN_FETCH_SECONDS:
+                    return "Polled recently."
+                if now < self.cache.get("backoff_until", 0):
+                    return "Backing off after a failure."
+                self.fetching = True
+                self.cache["last_attempt"] = now
         threading.Thread(target=self.fetch_now, daemon=True).start()
+        return None
+
+    def refresh_in_flight(self):
+        """True while a fetch is open, which is the one moment clicking
+        Refresh now cannot do anything. Reported as status rather than
+        enforced silently: a balloon is not a sufficient answer on its own,
+        since Windows suppresses notifications for an app it has no record of
+        the user granting them to, which makes a declined click look
+        identical to a broken one."""
+        with self.lock:
+            return self.fetching
 
     def fetch_now(self):
         now = time.time()
@@ -1299,18 +1447,49 @@ class Tray:
                 "plan": plan,
                 "fetched_at": now,
                 "backoff_until": 0,
+                "server_backoff_until": 0,
                 "error": None,
                 "fails": 0,
             }
             write_statusline_sidecar(payload)
         except urllib.error.HTTPError as err:
-            with self.lock:
-                fails = self.cache.get("fails", 0) + 1
-            update = {
-                "fails": fails,
-                "error": "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint",
-                "backoff_until": now + backoff_for(fails, err),
-            }
+            headers = getattr(err, "headers", None)
+            try:
+                asked = int((headers or {}).get("retry-after") or 0)
+            except (TypeError, ValueError):
+                asked = 0
+            if err.code == 429 and asked <= 0:
+                # Contention, not a fault. This endpoint's budget is shared
+                # with Claude Code, which polls it too, so being turned away
+                # is the ordinary outcome of two consumers rather than a sign
+                # anything is wrong -- measured at roughly one refusal in four
+                # even with nothing else of ours running. Escalating for it
+                # turns a skipped poll into minutes of blindness, and saying
+                # "rate limited" over figures fetched ninety seconds ago reads
+                # as a fault when it is just a turn missed.
+                #
+                # A 429 that names a wait is different, and falls through.
+                with self.lock:
+                    stale = self.cache.get("fetched_at", 0) < now - STALE_AFTER_SECONDS
+                update = {
+                    "error": "rate limited" if stale else None,
+                    "backoff_until": now + MIN_FETCH_SECONDS,
+                    "server_backoff_until": 0,
+                }
+            else:
+                with self.lock:
+                    fails = self.cache.get("fails", 0) + 1
+                wait = backoff_for(fails, err)
+                update = {
+                    "fails": fails,
+                    "error": (
+                        "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
+                    ),
+                    "backoff_until": now + wait,
+                    # Only an answer naming a wait is the server asking for
+                    # room; anything else is a failure we merely recorded.
+                    "server_backoff_until": now + wait if asked > 0 else 0,
+                }
         except Exception as err:  # noqa: BLE001 - never let the tray icon break
             with self.lock:
                 fails = self.cache.get("fails", 0) + 1
@@ -1319,6 +1498,7 @@ class Tray:
                 "error": redact(err) or err.__class__.__name__,
                 "fails": fails,
                 "backoff_until": now + backoff_for(fails),
+                "server_backoff_until": 0,
             }
         with self.lock:
             self.cache.update(update)
@@ -1337,11 +1517,19 @@ class Tray:
         # Informational rows first, greyed so they read as status rather than
         # as things to click.
         width = max([len(r["label"]) for r in rows] + [len("Extra credits")])
+        fetched_at = self.fetched_at()
         for row in rows:
-            reset = describe_reset(row["resets_at"])
-            label = f"{row['label']:<{width}}   {round(row['percent']):>3}%"
-            if reset:
-                label += f"   {reset}"
+            if rolled_over(row, fetched_at):
+                when = parse_ts(row["resets_at"]).astimezone()
+                label = (
+                    f"{row['label']:<{width}}   {'--':>3}    window ended "
+                    f"{when:%H:%M}, awaiting refresh"
+                )
+            else:
+                label = f"{row['label']:<{width}}   {round(row['percent']):>3}%"
+                reset = describe_reset(row["resets_at"])
+                if reset:
+                    label += f"   {reset}"
             user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, label)
 
         spend = (data or {}).get("spend") if isinstance((data or {}).get("spend"), dict) else {}
@@ -1380,7 +1568,10 @@ class Tray:
                 sanitize(redact(f"⚠ {detail}"), limit=120),
             )
         user32.AppendMenuW(menu, MF_STRING, ID_SETTINGS, "Open usage settings")
-        user32.AppendMenuW(menu, MF_STRING, ID_REFRESH, "Refresh now")
+        if self.refresh_in_flight():
+            user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, "Refreshing...")
+        else:
+            user32.AppendMenuW(menu, MF_STRING, ID_REFRESH, "Refresh now")
 
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         for label, enabled, ident in (
@@ -1412,7 +1603,9 @@ class Tray:
 
     def command(self, ident):
         if ident == ID_REFRESH:
-            self.maybe_fetch(force=True)
+            refused = self.maybe_fetch(force=True)
+            if refused:
+                self.balloon(refused, warning=True)
         elif ident == ID_SETTINGS:
             os.startfile(SETTINGS_URL)
         elif ident == ID_COLOR:
@@ -1476,6 +1669,10 @@ class Tray:
         elif message == WM_TIMER:
             # Display only: the countdowns are recomputed locally on every
             # tick, while maybe_fetch enforces the once-a-minute network floor.
+            # The two checks ahead of it can lift a backoff we set ourselves,
+            # so they run first or their finding waits a whole tick.
+            self.check_resume()
+            self.check_rollover()
             self.maybe_fetch()
             self.refresh_display()
         elif message == WM_FETCHED:

@@ -99,7 +99,7 @@ One uninterrupted first section, everything to do with the current reading:
 | Session / Weekly / Extra credits | Percentages, full reset times, credit spend |
 | Percentages as of, Plan | Provenance of the figures above |
 | Open usage settings | The real page on claude.ai |
-| Refresh now | Forces a poll, bypassing the local throttle but still respecting a server-imposed backoff |
+| Refresh now | Forces a poll, ignoring every backoff including the server's, with no floor of its own. Reads `Refreshing...` and is unclickable only while a request is actually open |
 
 Then a divider, the settings below, and Quit at the foot.
 
@@ -116,6 +116,13 @@ while it is running.
 When the endpoint fails or changes shape the icon shows a dim `--` with the reason in
 the menu, rather than disappearing. Fetches run on a worker thread, so a slow request
 never freezes the tray.
+
+The icon will not show a figure it cannot stand behind. After fifteen minutes without a
+successful fetch the digits lose their colour, so a stale reading can never sit there
+looking like a healthy green. If a usage window ended while the API was unreachable,
+the number counts a window nobody is in any more and is replaced by a dim `--`; the
+menu names the time it ended. Zero is not shown in its place, because a guess of zero
+invites you to spend a session you may already have spent.
 
 ## Rendering digits into an icon
 

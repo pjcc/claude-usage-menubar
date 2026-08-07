@@ -77,9 +77,36 @@ RED = 196
 # cadence drives the *display* only -- percentages come from cache and the
 # reset countdowns are recomputed locally on every tick, while the network is
 # touched at most once a minute and backs off when told to.
-MIN_FETCH_SECONDS = 60
-STALE_AFTER_SECONDS = 150
-MAX_BACKOFF_SECONDS = 3600
+# Measured 2026-08-07: the endpoint allows five calls, refuses the sixth, and
+# stays shut for 300s. Probes at +30s, +60s and +91s were all still refused, so
+# the budget does not trickle back a call at a time -- overshooting costs the
+# remainder of the window outright, which is why the margin matters more than
+# the average rate.
+#
+# 60s spends the entire budget and was what this used to poll at, so a single
+# extra call from anywhere -- a manual refresh, a restart -- locked it out. 90s
+# spends three or four of the five and leaves the rest for you. Faster buys
+# little anyway: the percentages move slowly, and the countdowns beside them
+# are recomputed locally every ten seconds regardless of when we last fetched.
+MIN_FETCH_SECONDS = 90
+# Roughly two missed polls, which is what this has always meant.
+STALE_AFTER_SECONDS = 240
+# The title flags staleness early because a discreet marker costs nothing.
+# Dropping the colour is louder, so it waits until the age is beyond
+# explaining away by a missed poll or two.
+UNCOLOURED_AFTER_SECONDS = 900
+# Two ceilings, because two different things are being waited out. The longer
+# one is for a server that told us to go away. Name resolution, routing and
+# timeouts fail on this machine without the request ever leaving it -- nobody
+# asked us to stay away, and capping those the same way is how a laptop that
+# slept through a network change sits all afternoon on figures from before it.
+#
+# The long ceiling is also the most we will take from a retry-after, because
+# that header is untrustworthy in both directions: observed returning 0 while
+# still refusing, and observed asking for a full hour and then serving the
+# very next request a minute later.
+MAX_BACKOFF_SECONDS = 900
+MAX_LOCAL_BACKOFF_SECONDS = 300
 
 LOGIN_LABEL = "com.ameba.SwiftBar"
 LOGIN_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LOGIN_LABEL}.plist")
@@ -313,9 +340,18 @@ def force_refresh():
     """Clear the local throttle so the next render fetches. Clears last_attempt
     rather than fetched_at: fetched_at means 'when we last had good data' and
     zeroing it made a failed forced refresh look infinitely stale forever.
-    Deliberately leaves backoff_until alone -- if the server said wait, we wait."""
+
+    The backoff goes with it, the server's included, and no floor replaces
+    it. All of that paces our *polling*, and the person clicking is overruling
+    exactly that. Deferring to the server here is what let an hour-long
+    retry-after -- from an endpoint that served the next request a minute
+    later -- disable the one control that exists to get past it.
+    """
     cache = load_cache()
     cache["last_attempt"] = 0
+    cache["backoff_until"] = 0
+    cache["server_backoff_until"] = 0
+    cache["fails"] = 0
     save_cache(cache)
     nudge_swiftbar()
 
@@ -335,18 +371,39 @@ def toggle_color():
 def backoff_for(fails, err=None):
     """Seconds to wait after a failed attempt.
 
-    Doubles per consecutive failure. The server's retry-after is honoured only
-    when it asks for *longer*: it has been observed returning `retry-after: 0`
-    while still refusing, and obeying that literally means retrying immediately
-    and forever, which is what keeps the limit tripped.
+    Doubles per consecutive failure, but the ceiling depends on who failed.
+    `err` present means the server answered, so it gets the long ceiling and
+    its retry-after is honoured -- though only when it asks for *longer*: it
+    has been observed returning `retry-after: 0` while still refusing, and
+    obeying that literally means retrying immediately and forever, which is
+    what keeps the limit tripped.
+
+    Everything else failed on this machine without the request ever leaving
+    it, so those get a ceiling measured in minutes.
     """
     wait = MIN_FETCH_SECONDS * (2 ** min(fails - 1, 8))
-    if err is not None:
-        try:
-            wait = max(wait, int(err.headers.get("retry-after") or 0))
-        except (TypeError, ValueError, AttributeError):
-            pass
+    if err is None:
+        return min(wait, MAX_LOCAL_BACKOFF_SECONDS)
+    try:
+        wait = max(wait, int(err.headers.get("retry-after") or 0))
+    except (TypeError, ValueError, AttributeError):
+        pass
     return min(wait, MAX_BACKOFF_SECONDS)
+
+
+def rolled_over(row, fetched_at):
+    """True when this row's window ended after our last good fetch.
+
+    Not merely 'the reset time has passed': the server can hand back a window
+    that expired moments ago and that reading is still the current truth. It
+    is only when the rollover happened while we were blind that the number on
+    screen counts a window nobody is in any more.
+    """
+    when = parse_ts(row.get("resets_at"))
+    if when is None or not fetched_at:
+        return False
+    reset_at = when.timestamp()
+    return reset_at <= time.time() and fetched_at < reset_at
 
 
 def credentials():
@@ -565,16 +622,26 @@ def credit_chip(spend):
     return f"{used}/{limit}"
 
 
-def render(data, plan, config, age=None, error=None, backoff_until=0):
+def render(data, plan, config, age=None, error=None, backoff_until=0, fetched_at=0):
     rows = collect_limits(data)
     spend = data.get("spend") if isinstance(data.get("spend"), dict) else {}
     show_credits = bool(config.get("show_credits", False))
 
     # Menu bar: "S:46% (3h39m) W:7% (5d0h)". Each limit's percentage is tinted
     # on its own, so you can see at a glance *which* one is the tight one.
-    use_color = bool(config.get("color", True))
+    # Past a certain age the tint comes off: a figure we cannot vouch for must
+    # not be able to read as a healthy green.
+    use_color = bool(config.get("color", True)) and not (
+        age is None or age > UNCOLOURED_AFTER_SECONDS
+    )
     chips = []
     for row in rows:
+        if rolled_over(row, fetched_at):
+            # The window this figure counted has ended. Zero would be the
+            # tempting guess, and the wrong one: it invites you to spend a
+            # session you may have spent already. We do not know, so say so.
+            chips.append(f"{row['tag']}:--")
+            continue
         percent = f"{round(row['percent'])}%"
         if use_color:
             percent = ansi_wrap(percent, alert_code(row["percent"], row["severity"]))
@@ -608,6 +675,14 @@ def render(data, plan, config, age=None, error=None, backoff_until=0):
     width = max([len(r["label"]) for r in rows] + [len("Extra credits")])
 
     for row in rows:
+        if rolled_over(row, fetched_at):
+            when = parse_ts(row["resets_at"]).astimezone()
+            line = (
+                f"{row['label']:<{width}}  {'--':>3}   window ended "
+                f"{when:%H:%M}, awaiting refresh"
+            )
+            print(f"{line} | {MONO}")
+            continue
         line = f"{row['label']:<{width}}  {round(row['percent']):>3}%"
         reset = describe_reset(row["resets_at"])
         if reset:
@@ -711,6 +786,18 @@ def main():
     # last_attempt gates the network; fetched_at records when data was last good.
     # Keeping them separate matters: a failed attempt must not make the cached
     # figures look fresh, and must not make them look infinitely stale either.
+    # A window that ended while we were blind is the one case where sitting out
+    # a backoff achieves nothing: the figure on screen counts a window nobody
+    # is in, and no amount of waiting improves it. Hold our own penalty -- never
+    # the server's -- down to the ordinary poll interval until a fetch lands.
+    cached = cache.get("data") if isinstance(cache.get("data"), dict) else {}
+    if now >= cache.get("server_backoff_until", 0) and any(
+        rolled_over(row, cache.get("fetched_at", 0)) for row in collect_limits(cached)
+    ):
+        cache["backoff_until"] = min(
+            cache.get("backoff_until", 0),
+            cache.get("last_attempt", 0) + MIN_FETCH_SECONDS,
+        )
     due = now - cache.get("last_attempt", 0) >= MIN_FETCH_SECONDS
     blocked = now < cache.get("backoff_until", 0)
 
@@ -724,24 +811,51 @@ def main():
                     "plan": plan,
                     "fetched_at": now,
                     "backoff_until": 0,
+                    "server_backoff_until": 0,
                     "error": None,
                     "fails": 0,
                 }
             )
             write_statusline_sidecar(cache["data"])
         except urllib.error.HTTPError as err:
-            fails = cache.get("fails", 0) + 1
-            cache["fails"] = fails
-            cache["error"] = (
-                "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
-            )
-            cache["backoff_until"] = now + backoff_for(fails, err)
+            headers = getattr(err, "headers", None)
+            try:
+                asked = int((headers or {}).get("retry-after") or 0)
+            except (TypeError, ValueError):
+                asked = 0
+            if err.code == 429 and asked <= 0:
+                # Contention, not a fault. This endpoint's budget is shared
+                # with Claude Code, which polls it too, so being turned away is
+                # the ordinary outcome of two consumers rather than a sign that
+                # anything is wrong -- measured at roughly one refusal in four
+                # even with nothing else of ours running. Escalating for it
+                # turns a skipped poll into minutes of blindness, and saying
+                # "rate limited" over figures fetched ninety seconds ago reads
+                # as a fault when it is just a turn missed.
+                #
+                # A 429 that names a wait is different, and falls through.
+                fresh = cache.get("fetched_at", 0) >= now - STALE_AFTER_SECONDS
+                cache["error"] = None if fresh else "rate limited"
+                cache["backoff_until"] = now + MIN_FETCH_SECONDS
+                cache["server_backoff_until"] = 0
+            else:
+                fails = cache.get("fails", 0) + 1
+                wait = backoff_for(fails, err)
+                cache["fails"] = fails
+                cache["error"] = (
+                    "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
+                )
+                cache["backoff_until"] = now + wait
+                # Only an answer naming a wait is the server asking for room;
+                # anything else is a failure we merely recorded.
+                cache["server_backoff_until"] = now + wait if asked > 0 else 0
         except Exception as err:  # noqa: BLE001 - never let the menu bar break
             fails = cache.get("fails", 0) + 1
             cache["fails"] = fails
             # redact: an exception string could conceivably carry the token.
             cache["error"] = redact(err) or err.__class__.__name__
             cache["backoff_until"] = now + backoff_for(fails)
+            cache["server_backoff_until"] = 0
         save_cache(cache)
 
     data = cache.get("data")
@@ -758,6 +872,7 @@ def main():
         age,
         cache.get("error"),
         cache.get("backoff_until", 0),
+        fetched_at,
     )
 
 

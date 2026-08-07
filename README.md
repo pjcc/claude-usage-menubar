@@ -41,20 +41,64 @@ reason in the menu rather than breaking your menu bar or taskbar.
 
 ### Refresh: 10s on screen, at most once a minute on the wire
 
-The endpoint rate-limits hard. Around a dozen calls in a few minutes earns an HTTP 429,
-and it has been observed returning `retry-after: 0` while still refusing, so that
-header cannot be trusted as guidance on its own. Rendering and fetching are therefore
-separate:
+**The budget is shared with Claude Code**, which polls the same endpoint for its own
+limit display. Measured by stopping the tray, sitting completely idle for six minutes
+and then making a single call: it was **refused**, `retry-after: 0`. Nothing else could
+have spent that budget. Polling at 90s as the only caller under our control still drew a
+refusal roughly one time in four.
+
+So being turned away is the ordinary outcome of two consumers, not a fault, and **no
+polling interval avoids it**. What matters is that it costs a skipped poll rather than
+an escalating penalty - see the `retry-after: 0` handling below.
+
+The endpoint rate-limits hard. Measured on 2026-08-07, twice, with consistent results:
+
+- it serves **5 calls** and refuses the 6th with HTTP 429
+- the refusal lasts **300s**, and `Retry-After: 300` was accurate to within 4 seconds
+- requests made while refused **do not extend** the block
+- the budget does **not** trickle back a call at a time. Probes at +30s, +60s and +91s
+  were all still refused, so overshooting costs the remainder of the window outright
+- so the sustained ceiling is about **one call per minute**
+
+That last figure is the one that matters, because it is also what this used to poll at.
+At 60s the entire budget went on polling, so one extra call from anywhere - a manual
+refresh, a restart - was enough to lock it out, and a 429 every few hours was routine.
+Polling is now every **90s**, which spends three or four of the five and leaves the rest
+for you. Nothing shorter is safe: 60s is the ceiling itself, not a margin beneath it.
+
+`Retry-After` is honoured but never trusted, because it is not always that honest: the
+same endpoint has been seen returning `0` while still refusing, and - after several
+hours of repeated tripping - asking for a full hour and then serving normally 17 minutes
+later. It is treated as a hint with a ceiling.
+
+Its value is also what separates the two kinds of 429. **`retry-after: 0` or absent is
+contention** - somebody else got there first - and costs exactly one skipped poll, with
+no escalation and no error shown while the figures on screen are still fresh. **A 429
+naming a real wait** is a genuine lockout, and gets the full treatment. Rendering and
+fetching are therefore separate:
 
 - the display re-renders every **10s**. This costs no network, and lets the retry
   countdown tick in seconds
-- the network is touched **at most once a minute**, and only when not already backing
-  off
-- failures back off **exponentially**: 60s, doubling per consecutive failure, capped at
-  one hour. A server `retry-after` is honoured only when it asks for longer than that
+- the network is touched **at most once every 90 seconds**, and only when not already
+  backing off
+- failures back off **exponentially**: 60s, doubling per consecutive failure. The
+  ceiling depends on who failed. A server that answered gets **fifteen minutes**, which
+  is also the most that will be taken from a `retry-after`. A failure on this machine -
+  no DNS, no route, a timeout - never reached the server, so nobody asked us to stay
+  away: those cap at **five minutes**
+- **a hand-driven refresh ignores every one of those**, the server's `retry-after`
+  included, and has no floor of its own. All of it paces *polling*, and clicking Refresh
+  now is overruling exactly that. The only moment the item is withheld is while a
+  request is genuinely open, where it reads `Refreshing...` - a statement of fact, not
+  a restriction
+- recovery is **triggered, not just waited out**. Waking from sleep resets the penalty
+  outright, and a usage window that ended while we were offline holds it down to the
+  ordinary poll interval
 - reset countdowns are recomputed **locally** on every render, so they stay accurate
   between polls
-- percentages come from cache, and are flagged once genuinely stale
+- percentages come from cache, and are flagged once genuinely stale. If a window rolled
+  over while we could not reach the API, the figure counts a window nobody is in any
+  more, so it is replaced by `--` rather than shown or guessed at as zero
 
 ### Hardening
 
