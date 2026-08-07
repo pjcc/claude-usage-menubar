@@ -78,10 +78,6 @@ RED = 196
 # reset countdowns are recomputed locally on every tick, while the network is
 # touched at most once a minute and backs off when told to.
 MIN_FETCH_SECONDS = 60
-# A hand-driven refresh answers to this instead. One request per click, a
-# minute apart, is a person asking a question -- not something to protect the
-# server from.
-MIN_FORCED_SECONDS = 60
 STALE_AFTER_SECONDS = 150
 # The title flags staleness early because a discreet marker costs nothing.
 # Dropping the colour is louder, so it waits until the age is beyond
@@ -333,17 +329,13 @@ def force_refresh():
     rather than fetched_at: fetched_at means 'when we last had good data' and
     zeroing it made a failed forced refresh look infinitely stale forever.
 
-    The backoff goes with it, the server's included. It paces our *polling*,
-    and the person clicking is overruling exactly that: the click costs one
-    request, no oftener than MIN_FORCED_SECONDS. Deferring to the server here
-    is what let an hour-long retry-after -- from an endpoint that served the
-    next request a minute later -- disable the one control that exists to get
-    past it.
+    The backoff goes with it, the server's included, and no floor replaces
+    it. All of that paces our *polling*, and the person clicking is overruling
+    exactly that. Deferring to the server here is what let an hour-long
+    retry-after -- from an endpoint that served the next request a minute
+    later -- disable the one control that exists to get past it.
     """
     cache = load_cache()
-    if time.time() - cache.get("last_attempt", 0) < MIN_FORCED_SECONDS:
-        nudge_swiftbar()
-        return
     cache["last_attempt"] = 0
     cache["backoff_until"] = 0
     cache["server_backoff_until"] = 0

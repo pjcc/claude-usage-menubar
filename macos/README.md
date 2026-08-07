@@ -78,8 +78,8 @@ other windows.
 | Colour in menu bar | on | Off means no colour at all, not a different colour |
 | Open at login | on | Manages a LaunchAgent at `~/Library/LaunchAgents/com.ameba.SwiftBar.plist` |
 
-**Refresh now** forces a poll, ignoring every backoff including the server's. It is
-limited only against itself, at once a minute.
+**Refresh now** forces a poll, ignoring every backoff including the server's, with no
+floor of its own.
 
 ## Files
 

@@ -99,7 +99,7 @@ One uninterrupted first section, everything to do with the current reading:
 | Session / Weekly / Extra credits | Percentages, full reset times, credit spend |
 | Percentages as of, Plan | Provenance of the figures above |
 | Open usage settings | The real page on claude.ai |
-| Refresh now | Forces a poll, ignoring every backoff including the server's. Limited only against itself, once a minute - inside that minute the item greys out and shows the countdown |
+| Refresh now | Forces a poll, ignoring every backoff including the server's, with no floor of its own. Reads `Refreshing...` and is unclickable only while a request is actually open |
 
 Then a divider, the settings below, and Quit at the foot.
 

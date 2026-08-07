@@ -93,11 +93,6 @@ RED = (255, 0, 0)
 MUTED = (138, 138, 142)
 
 MIN_FETCH_SECONDS = 60
-# A hand-driven refresh answers to this instead: it exists to override the
-# poll cadence, so the only floor it keeps is the one stopping a held mouse
-# button from becoming a request loop. One request per click, a minute apart,
-# is a person asking a question -- not something to protect the server from.
-MIN_FORCED_SECONDS = 60
 STALE_AFTER_SECONDS = 150
 # The tooltip flags staleness early because you had to hover to read it. The
 # icon is glanced at, so it only dims once the age is beyond explaining away
@@ -1396,40 +1391,39 @@ class Tray:
         """
         now = time.time()
         with self.lock:
+            # The only bar a forced refresh cannot clear, and not a policy: a
+            # second request cannot start while the first is still open
+            # without racing it for the cache.
             if self.fetching:
                 return "A refresh is already running."
-            floor = MIN_FORCED_SECONDS if force else MIN_FETCH_SECONDS
-            wait = int(self.cache.get("last_attempt", 0) + floor - now)
-            if wait > 0:
-                return f"Just tried that -- ready again in {wait}s."
-            # The backoff paces our *polling*. Someone clicking Refresh now is
-            # overruling exactly that, so it does not apply to them: the click
-            # costs one request, no oftener than the floor above. Deferring to
-            # the server here is what left an hour-long retry-after -- from an
-            # endpoint that served the next request a minute later -- able to
-            # grey out the only control that exists to get past it.
-            if not force and now < self.cache.get("backoff_until", 0):
-                return "Backing off after a failure."
-            self.fetching = True
-            self.cache["last_attempt"] = now
+            # Everything below paces our *polling*. Someone clicking Refresh
+            # now is overruling exactly that, so none of it applies to them.
+            # There is no floor on top: a popup menu cannot auto-repeat, the
+            # sustained load is the once-a-minute poll rather than a person
+            # clicking, and rate-limiting the control whose whole purpose is
+            # to override a rate limit is how this went wrong twice already.
+            if force:
+                self.fetching = True
+                self.cache["last_attempt"] = now
+            else:
+                if now - self.cache.get("last_attempt", 0) < MIN_FETCH_SECONDS:
+                    return "Polled recently."
+                if now < self.cache.get("backoff_until", 0):
+                    return "Backing off after a failure."
+                self.fetching = True
+                self.cache["last_attempt"] = now
         threading.Thread(target=self.fetch_now, daemon=True).start()
         return None
 
-    def refresh_refusal(self):
-        """What would stop a hand-driven refresh right now, or None.
-
-        Asked before the menu is built, so the item can be greyed with its
-        reason rather than offered and then ignored. A balloon is not a
-        sufficient answer on its own: Windows suppresses notifications for an
-        app it has no record of the user granting them to, which makes a
-        declined click indistinguishable from a broken one.
-        """
-        now = time.time()
+    def refresh_in_flight(self):
+        """True while a fetch is open, which is the one moment clicking
+        Refresh now cannot do anything. Reported as status rather than
+        enforced silently: a balloon is not a sufficient answer on its own,
+        since Windows suppresses notifications for an app it has no record of
+        the user granting them to, which makes a declined click look
+        identical to a broken one."""
         with self.lock:
-            if self.fetching:
-                return "Refreshing..."
-            wait = int(self.cache.get("last_attempt", 0) + MIN_FORCED_SECONDS - now)
-        return f"Refresh now (ready in {wait}s)" if wait > 0 else None
+            return self.fetching
 
     def fetch_now(self):
         now = time.time()
@@ -1539,9 +1533,8 @@ class Tray:
                 sanitize(redact(f"⚠ {detail}"), limit=120),
             )
         user32.AppendMenuW(menu, MF_STRING, ID_SETTINGS, "Open usage settings")
-        refusal = self.refresh_refusal()
-        if refusal:
-            user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, refusal)
+        if self.refresh_in_flight():
+            user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, "Refreshing...")
         else:
             user32.AppendMenuW(menu, MF_STRING, ID_REFRESH, "Refresh now")
 

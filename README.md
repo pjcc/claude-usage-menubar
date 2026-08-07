@@ -56,11 +56,11 @@ instruction. Rendering and fetching are therefore separate:
   is also the most that will be taken from a `retry-after`. A failure on this machine -
   no DNS, no route, a timeout - never reached the server, so nobody asked us to stay
   away: those cap at **five minutes**
-- **a hand-driven refresh ignores the backoff entirely**, the server's included. The
-  backoff paces *polling*, and clicking Refresh now is overruling exactly that. It costs
-  one request and is rate-limited only against itself, at once a minute. When it is
-  inside that minute the menu item greys out and shows the countdown, rather than being
-  offered and then declining
+- **a hand-driven refresh ignores every one of those**, the server's `retry-after`
+  included, and has no floor of its own. All of it paces *polling*, and clicking Refresh
+  now is overruling exactly that. The only moment the item is withheld is while a
+  request is genuinely open, where it reads `Refreshing...` - a statement of fact, not
+  a restriction
 - recovery is **triggered, not just waited out**. Waking from sleep resets the penalty
   outright, and a usage window that ended while we were offline holds it down to the
   ordinary poll interval
