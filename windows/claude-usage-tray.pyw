@@ -1453,20 +1453,43 @@ class Tray:
             }
             write_statusline_sidecar(payload)
         except urllib.error.HTTPError as err:
-            with self.lock:
-                fails = self.cache.get("fails", 0) + 1
-            wait = backoff_for(fails, err)
-            # A 429, or any answer carrying retry-after, is the server asking
-            # for room. Every other HTTP code is just a failure -- recorded,
-            # backed off, but not something a person may not override.
             headers = getattr(err, "headers", None)
-            asked = err.code == 429 or bool(headers and headers.get("retry-after"))
-            update = {
-                "fails": fails,
-                "error": "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint",
-                "backoff_until": now + wait,
-                "server_backoff_until": now + wait if asked else 0,
-            }
+            try:
+                asked = int((headers or {}).get("retry-after") or 0)
+            except (TypeError, ValueError):
+                asked = 0
+            if err.code == 429 and asked <= 0:
+                # Contention, not a fault. This endpoint's budget is shared
+                # with Claude Code, which polls it too, so being turned away
+                # is the ordinary outcome of two consumers rather than a sign
+                # anything is wrong -- measured at roughly one refusal in four
+                # even with nothing else of ours running. Escalating for it
+                # turns a skipped poll into minutes of blindness, and saying
+                # "rate limited" over figures fetched ninety seconds ago reads
+                # as a fault when it is just a turn missed.
+                #
+                # A 429 that names a wait is different, and falls through.
+                with self.lock:
+                    stale = self.cache.get("fetched_at", 0) < now - STALE_AFTER_SECONDS
+                update = {
+                    "error": "rate limited" if stale else None,
+                    "backoff_until": now + MIN_FETCH_SECONDS,
+                    "server_backoff_until": 0,
+                }
+            else:
+                with self.lock:
+                    fails = self.cache.get("fails", 0) + 1
+                wait = backoff_for(fails, err)
+                update = {
+                    "fails": fails,
+                    "error": (
+                        "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
+                    ),
+                    "backoff_until": now + wait,
+                    # Only an answer naming a wait is the server asking for
+                    # room; anything else is a failure we merely recorded.
+                    "server_backoff_until": now + wait if asked > 0 else 0,
+                }
         except Exception as err:  # noqa: BLE001 - never let the tray icon break
             with self.lock:
                 fails = self.cache.get("fails", 0) + 1

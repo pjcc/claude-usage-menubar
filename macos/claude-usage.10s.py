@@ -818,19 +818,37 @@ def main():
             )
             write_statusline_sidecar(cache["data"])
         except urllib.error.HTTPError as err:
-            fails = cache.get("fails", 0) + 1
-            wait = backoff_for(fails, err)
-            cache["fails"] = fails
-            cache["error"] = (
-                "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
-            )
-            cache["backoff_until"] = now + wait
-            # A 429, or any answer carrying retry-after, is the server asking
-            # for room. Every other HTTP code is just a failure -- recorded and
-            # backed off, but not something a person may not override.
             headers = getattr(err, "headers", None)
-            asked = err.code == 429 or bool(headers and headers.get("retry-after"))
-            cache["server_backoff_until"] = now + wait if asked else 0
+            try:
+                asked = int((headers or {}).get("retry-after") or 0)
+            except (TypeError, ValueError):
+                asked = 0
+            if err.code == 429 and asked <= 0:
+                # Contention, not a fault. This endpoint's budget is shared
+                # with Claude Code, which polls it too, so being turned away is
+                # the ordinary outcome of two consumers rather than a sign that
+                # anything is wrong -- measured at roughly one refusal in four
+                # even with nothing else of ours running. Escalating for it
+                # turns a skipped poll into minutes of blindness, and saying
+                # "rate limited" over figures fetched ninety seconds ago reads
+                # as a fault when it is just a turn missed.
+                #
+                # A 429 that names a wait is different, and falls through.
+                fresh = cache.get("fetched_at", 0) >= now - STALE_AFTER_SECONDS
+                cache["error"] = None if fresh else "rate limited"
+                cache["backoff_until"] = now + MIN_FETCH_SECONDS
+                cache["server_backoff_until"] = 0
+            else:
+                fails = cache.get("fails", 0) + 1
+                wait = backoff_for(fails, err)
+                cache["fails"] = fails
+                cache["error"] = (
+                    "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
+                )
+                cache["backoff_until"] = now + wait
+                # Only an answer naming a wait is the server asking for room;
+                # anything else is a failure we merely recorded.
+                cache["server_backoff_until"] = now + wait if asked > 0 else 0
         except Exception as err:  # noqa: BLE001 - never let the menu bar break
             fails = cache.get("fails", 0) + 1
             cache["fails"] = fails
