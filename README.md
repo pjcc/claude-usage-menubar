@@ -46,11 +46,15 @@ The endpoint rate-limits hard. Measured on 2026-08-07, twice, with consistent re
 - it serves **5 calls** and refuses the 6th with HTTP 429
 - the refusal lasts **300s**, and `Retry-After: 300` was accurate to within 4 seconds
 - requests made while refused **do not extend** the block
+- the budget does **not** trickle back a call at a time. Probes at +30s, +60s and +91s
+  were all still refused, so overshooting costs the remainder of the window outright
 - so the sustained ceiling is about **one call per minute**
 
 That last figure is the one that matters, because it is also what this used to poll at.
-Claude Code hits the same endpoint, so at 60s there was no headroom at all and a 429
-every few hours was routine. Polling is now every 120s.
+At 60s the entire budget went on polling, so one extra call from anywhere - a manual
+refresh, a restart - was enough to lock it out, and a 429 every few hours was routine.
+Polling is now every **90s**, which spends three or four of the five and leaves the rest
+for you. Nothing shorter is safe: 60s is the ceiling itself, not a margin beneath it.
 
 `Retry-After` is honoured but never trusted, because it is not always that honest: the
 same endpoint has been seen returning `0` while still refusing, and - after several
@@ -60,7 +64,7 @@ separate:
 
 - the display re-renders every **10s**. This costs no network, and lets the retry
   countdown tick in seconds
-- the network is touched **at most once every two minutes**, and only when not already
+- the network is touched **at most once every 90 seconds**, and only when not already
   backing off
 - failures back off **exponentially**: 60s, doubling per consecutive failure. The
   ceiling depends on who failed. A server that answered gets **fifteen minutes**, which

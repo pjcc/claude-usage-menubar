@@ -93,14 +93,19 @@ RED = (255, 0, 0)
 MUTED = (138, 138, 142)
 
 # Measured 2026-08-07: the endpoint allows five calls, refuses the sixth, and
-# stays shut for 300s. Sustained, that is one call a minute -- which is what
-# this used to poll at, leaving no headroom whatsoever for Claude Code hitting
-# the same endpoint or for anyone touching Refresh now. Two minutes keeps less
-# than half the budget for us and costs nothing: the percentages move slowly
-# and the countdowns beside them are computed locally every ten seconds.
-MIN_FETCH_SECONDS = 120
-# Two missed polls, as before, now that a poll is twice as far apart.
-STALE_AFTER_SECONDS = 300
+# stays shut for 300s. Probes at +30s, +60s and +91s were all still refused, so
+# the budget does not trickle back a call at a time -- overshooting costs the
+# remainder of the window outright, which is why the margin matters more than
+# the average rate.
+#
+# 60s spends the entire budget and was what this used to poll at, so a single
+# extra call from anywhere -- a manual refresh, a restart -- locked it out. 90s
+# spends three or four of the five and leaves the rest for you. Faster buys
+# little anyway: the percentages move slowly, and the countdowns beside them
+# are recomputed locally every ten seconds regardless of when we last fetched.
+MIN_FETCH_SECONDS = 90
+# Roughly two missed polls, which is what this has always meant.
+STALE_AFTER_SECONDS = 240
 # The tooltip flags staleness early because you had to hover to read it. The
 # icon is glanced at, so it only dims once the age is beyond explaining away
 # by a missed poll or two -- at which point the figure is not a live reading.
