@@ -95,19 +95,26 @@ MUTED = (138, 138, 142)
 MIN_FETCH_SECONDS = 60
 # A hand-driven refresh answers to this instead: it exists to override the
 # poll cadence, so the only floor it keeps is the one stopping a held mouse
-# button from becoming a request loop.
-MIN_FORCED_SECONDS = 5
+# button from becoming a request loop. One request per click, a minute apart,
+# is a person asking a question -- not something to protect the server from.
+MIN_FORCED_SECONDS = 60
 STALE_AFTER_SECONDS = 150
 # The tooltip flags staleness early because you had to hover to read it. The
 # icon is glanced at, so it only dims once the age is beyond explaining away
 # by a missed poll or two -- at which point the figure is not a live reading.
 ICON_STALE_AFTER_SECONDS = 900
-# Two ceilings, because two very different things are being waited out. An
-# hour is for a server that told us to go away. Our own end failing -- no
-# DNS, no route, a timeout -- is nobody asking for anything, and capping
-# those at an hour is how a machine that briefly lost its network sits five
+# Two ceilings, because two very different things are being waited out. The
+# longer one is for a server that told us to go away. Our own end failing --
+# no DNS, no route, a timeout -- is nobody asking for anything, and capping
+# those the same way is how a machine that briefly lost its network sits five
 # hours stale with the figures from before it slept.
-MAX_BACKOFF_SECONDS = 3600
+#
+# The long ceiling is also the most we will take from a retry-after, because
+# that header is untrustworthy in both directions: observed returning 0 while
+# still refusing, and observed asking for a full hour and then serving the
+# very next request a minute later. Honouring the latter literally is how a
+# widget whose whole job is to be current goes an hour without asking.
+MAX_BACKOFF_SECONDS = 900
 MAX_LOCAL_BACKOFF_SECONDS = 300
 # A 10s timer that has not ticked in two minutes did not run late; the
 # machine was suspended in between.
@@ -1391,25 +1398,38 @@ class Tray:
         with self.lock:
             if self.fetching:
                 return "A refresh is already running."
-            if force:
-                # Our own backoff spares the network; the person clicking has
-                # just overruled that, and a refresh that silently declines is
-                # worse than no refresh at all. Only a wait the server itself
-                # asked for survives this -- and the floor, which is here to
-                # stop a held mouse button becoming a request loop.
-                held = self.cache.get("server_backoff_until", 0)
-                floor = MIN_FORCED_SECONDS
-            else:
-                held = self.cache.get("backoff_until", 0)
-                floor = MIN_FETCH_SECONDS
-            if now - self.cache.get("last_attempt", 0) < floor:
-                return "Just tried that -- give it a few seconds."
-            if now < held:
-                return f"Rate limited. Holding off until {datetime.fromtimestamp(held):%H:%M:%S}."
+            floor = MIN_FORCED_SECONDS if force else MIN_FETCH_SECONDS
+            wait = int(self.cache.get("last_attempt", 0) + floor - now)
+            if wait > 0:
+                return f"Just tried that -- ready again in {wait}s."
+            # The backoff paces our *polling*. Someone clicking Refresh now is
+            # overruling exactly that, so it does not apply to them: the click
+            # costs one request, no oftener than the floor above. Deferring to
+            # the server here is what left an hour-long retry-after -- from an
+            # endpoint that served the next request a minute later -- able to
+            # grey out the only control that exists to get past it.
+            if not force and now < self.cache.get("backoff_until", 0):
+                return "Backing off after a failure."
             self.fetching = True
             self.cache["last_attempt"] = now
         threading.Thread(target=self.fetch_now, daemon=True).start()
         return None
+
+    def refresh_refusal(self):
+        """What would stop a hand-driven refresh right now, or None.
+
+        Asked before the menu is built, so the item can be greyed with its
+        reason rather than offered and then ignored. A balloon is not a
+        sufficient answer on its own: Windows suppresses notifications for an
+        app it has no record of the user granting them to, which makes a
+        declined click indistinguishable from a broken one.
+        """
+        now = time.time()
+        with self.lock:
+            if self.fetching:
+                return "Refreshing..."
+            wait = int(self.cache.get("last_attempt", 0) + MIN_FORCED_SECONDS - now)
+        return f"Refresh now (ready in {wait}s)" if wait > 0 else None
 
     def fetch_now(self):
         now = time.time()
@@ -1519,7 +1539,11 @@ class Tray:
                 sanitize(redact(f"⚠ {detail}"), limit=120),
             )
         user32.AppendMenuW(menu, MF_STRING, ID_SETTINGS, "Open usage settings")
-        user32.AppendMenuW(menu, MF_STRING, ID_REFRESH, "Refresh now")
+        refusal = self.refresh_refusal()
+        if refusal:
+            user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, refusal)
+        else:
+            user32.AppendMenuW(menu, MF_STRING, ID_REFRESH, "Refresh now")
 
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         for label, enabled, ident in (

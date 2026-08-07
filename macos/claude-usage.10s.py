@@ -78,17 +78,26 @@ RED = 196
 # reset countdowns are recomputed locally on every tick, while the network is
 # touched at most once a minute and backs off when told to.
 MIN_FETCH_SECONDS = 60
+# A hand-driven refresh answers to this instead. One request per click, a
+# minute apart, is a person asking a question -- not something to protect the
+# server from.
+MIN_FORCED_SECONDS = 60
 STALE_AFTER_SECONDS = 150
 # The title flags staleness early because a discreet marker costs nothing.
 # Dropping the colour is louder, so it waits until the age is beyond
 # explaining away by a missed poll or two.
 UNCOLOURED_AFTER_SECONDS = 900
-# Two ceilings, because two different things are being waited out. An hour is
-# for a server that told us to go away. Name resolution, routing and timeouts
-# fail on this machine without the request ever leaving it -- nobody asked us
-# to stay away, and capping those at an hour is how a laptop that slept
-# through a network change sits all afternoon on the figures from before it.
-MAX_BACKOFF_SECONDS = 3600
+# Two ceilings, because two different things are being waited out. The longer
+# one is for a server that told us to go away. Name resolution, routing and
+# timeouts fail on this machine without the request ever leaving it -- nobody
+# asked us to stay away, and capping those the same way is how a laptop that
+# slept through a network change sits all afternoon on figures from before it.
+#
+# The long ceiling is also the most we will take from a retry-after, because
+# that header is untrustworthy in both directions: observed returning 0 while
+# still refusing, and observed asking for a full hour and then serving the
+# very next request a minute later.
+MAX_BACKOFF_SECONDS = 900
 MAX_LOCAL_BACKOFF_SECONDS = 300
 
 LOGIN_LABEL = "com.ameba.SwiftBar"
@@ -324,15 +333,21 @@ def force_refresh():
     rather than fetched_at: fetched_at means 'when we last had good data' and
     zeroing it made a failed forced refresh look infinitely stale forever.
 
-    The backoff goes too, unless the server is the one asking. Our own is
-    there to spare the network, and the person clicking has just overruled
-    that -- a refresh that silently declines is worse than no refresh at all.
+    The backoff goes with it, the server's included. It paces our *polling*,
+    and the person clicking is overruling exactly that: the click costs one
+    request, no oftener than MIN_FORCED_SECONDS. Deferring to the server here
+    is what let an hour-long retry-after -- from an endpoint that served the
+    next request a minute later -- disable the one control that exists to get
+    past it.
     """
     cache = load_cache()
+    if time.time() - cache.get("last_attempt", 0) < MIN_FORCED_SECONDS:
+        nudge_swiftbar()
+        return
     cache["last_attempt"] = 0
-    if time.time() >= cache.get("server_backoff_until", 0):
-        cache["backoff_until"] = 0
-        cache["fails"] = 0
+    cache["backoff_until"] = 0
+    cache["server_backoff_until"] = 0
+    cache["fails"] = 0
     save_cache(cache)
     nudge_swiftbar()
 

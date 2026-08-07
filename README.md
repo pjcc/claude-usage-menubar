@@ -41,23 +41,26 @@ reason in the menu rather than breaking your menu bar or taskbar.
 
 ### Refresh: 10s on screen, at most once a minute on the wire
 
-The endpoint rate-limits hard. Around a dozen calls in a few minutes earns an HTTP 429,
-and it has been observed returning `retry-after: 0` while still refusing, so that
-header cannot be trusted as guidance on its own. Rendering and fetching are therefore
-separate:
+The endpoint rate-limits hard. Around a dozen calls in a few minutes earns an HTTP 429.
+Its `retry-after` cannot be trusted in either direction: it has been observed returning
+`0` while still refusing, and observed asking for a full hour and then serving the very
+next request a minute later. It is treated as a hint with a ceiling, never as an
+instruction. Rendering and fetching are therefore separate:
 
 - the display re-renders every **10s**. This costs no network, and lets the retry
   countdown tick in seconds
 - the network is touched **at most once a minute**, and only when not already backing
   off
 - failures back off **exponentially**: 60s, doubling per consecutive failure. The
-  ceiling depends on who failed. A server that answered gets **one hour**, and its
-  `retry-after` is honoured when it asks for longer than that. A failure on this
-  machine - no DNS, no route, a timeout - never reached the server, so nobody asked
-  us to stay away: those cap at **five minutes**
-- **a hand-driven refresh clears our own backoff.** It exists to spare the network, and
-  you have just overruled it. Only a wait the server actually asked for survives, and
-  the refresh says so rather than declining in silence
+  ceiling depends on who failed. A server that answered gets **fifteen minutes**, which
+  is also the most that will be taken from a `retry-after`. A failure on this machine -
+  no DNS, no route, a timeout - never reached the server, so nobody asked us to stay
+  away: those cap at **five minutes**
+- **a hand-driven refresh ignores the backoff entirely**, the server's included. The
+  backoff paces *polling*, and clicking Refresh now is overruling exactly that. It costs
+  one request and is rate-limited only against itself, at once a minute. When it is
+  inside that minute the menu item greys out and shows the countdown, rather than being
+  offered and then declining
 - recovery is **triggered, not just waited out**. Waking from sleep resets the penalty
   outright, and a usage window that ended while we were offline holds it down to the
   ordinary poll interval
