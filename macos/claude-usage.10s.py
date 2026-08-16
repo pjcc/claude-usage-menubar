@@ -406,6 +406,30 @@ def rolled_over(row, fetched_at):
     return reset_at <= time.time() and fetched_at < reset_at
 
 
+def unanchored(row):
+    """True when a row carries no window boundary at all.
+
+    A session nobody is in comes back as `percent: 0` with `resets_at: null`:
+    there is no window, so there is no clock to compare against and
+    rolled_over() cannot see anything. While the reading is fresh that is
+    simply the truth, and 0 is the right thing to show. Once it is stale it
+    becomes unknowable -- a session started since would have opened a window we
+    never saw, and the 0 we are holding describes only the quiet before it.
+    """
+    return parse_ts(row.get("resets_at")) is None
+
+
+def unreliable(row, fetched_at, age):
+    """The two ways a figure stops describing anything we can stand behind:
+    its window ended while we were blind, or it never named a window and has
+    since gone stale. Kept in one place because the title and the dropdown must
+    agree -- a `--` in the menu bar beside a number below it is worse than
+    either alone."""
+    if rolled_over(row, fetched_at):
+        return True
+    return unanchored(row) and (age is None or age > UNCOLOURED_AFTER_SECONDS)
+
+
 def credentials():
     """Returns (access_token, plan). Claude Code refreshes the token in place,
     so this is read fresh on every poll rather than cached."""
@@ -636,7 +660,7 @@ def render(data, plan, config, age=None, error=None, backoff_until=0, fetched_at
     )
     chips = []
     for row in rows:
-        if rolled_over(row, fetched_at):
+        if unreliable(row, fetched_at, age):
             # The window this figure counted has ended. Zero would be the
             # tempting guess, and the wrong one: it invites you to spend a
             # session you may have spent already. We do not know, so say so.
@@ -680,6 +704,15 @@ def render(data, plan, config, age=None, error=None, backoff_until=0, fetched_at
             line = (
                 f"{row['label']:<{width}}  {'--':>3}   window ended "
                 f"{when:%H:%M}, awaiting refresh"
+            )
+            print(f"{line} | {MONO}")
+            continue
+        if unreliable(row, fetched_at, age):
+            # No window to name, so nothing to date it against: say what we
+            # actually last saw rather than dressing 0 up as current.
+            line = (
+                f"{row['label']:<{width}}  {'--':>3}   "
+                "no window open when last seen"
             )
             print(f"{line} | {MONO}")
             continue
@@ -786,13 +819,16 @@ def main():
     # last_attempt gates the network; fetched_at records when data was last good.
     # Keeping them separate matters: a failed attempt must not make the cached
     # figures look fresh, and must not make them look infinitely stale either.
-    # A window that ended while we were blind is the one case where sitting out
-    # a backoff achieves nothing: the figure on screen counts a window nobody
-    # is in, and no amount of waiting improves it. Hold our own penalty -- never
-    # the server's -- down to the ordinary poll interval until a fetch lands.
+    # A figure we can no longer stand behind is the one case where sitting out
+    # a backoff achieves nothing: it counts a window nobody is in, or none we
+    # ever saw, and no amount of waiting improves it. Hold our own penalty --
+    # never the server's -- down to the ordinary poll interval until a fetch
+    # lands.
     cached = cache.get("data") if isinstance(cache.get("data"), dict) else {}
+    cached_at = cache.get("fetched_at", 0)
+    cached_age = now - cached_at if cached_at else None
     if now >= cache.get("server_backoff_until", 0) and any(
-        rolled_over(row, cache.get("fetched_at", 0)) for row in collect_limits(cached)
+        unreliable(row, cached_at, cached_age) for row in collect_limits(cached)
     ):
         cache["backoff_until"] = min(
             cache.get("backoff_until", 0),

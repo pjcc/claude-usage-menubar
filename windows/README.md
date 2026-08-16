@@ -124,6 +124,13 @@ the number counts a window nobody is in any more and is replaced by a dim `--`; 
 menu names the time it ended. Zero is not shown in its place, because a guess of zero
 invites you to spend a session you may already have spent.
 
+A session nobody is in is reported as `0%` with no reset time at all, which is why the
+same rule has to cover it separately: with no window there is no clock to compare
+against, so nothing looks rolled over however old it gets. Fresh, that `0` is simply
+true and is shown. Once it is stale it becomes `--` as well, since a session started in
+the meantime would have opened a window this reading knows nothing about. The menu says
+`no window open when last seen`.
+
 ## Rendering digits into an icon
 
 GDI text drawing does not write an alpha channel, so painting coloured text onto a
