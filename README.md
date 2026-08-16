@@ -99,6 +99,10 @@ fetching are therefore separate:
 - percentages come from cache, and are flagged once genuinely stale. If a window rolled
   over while we could not reach the API, the figure counts a window nobody is in any
   more, so it is replaced by `--` rather than shown or guessed at as zero
+- the same applies to a figure with no window at all. A session nobody is in comes back
+  as `0%` with a null reset time, which is the plain truth while it is fresh and
+  unknowable once it is not: any session started since opened a window we never saw. So
+  a stale `0` becomes `--` too, rather than sitting there looking like a full session
 
 ### Hardening
 

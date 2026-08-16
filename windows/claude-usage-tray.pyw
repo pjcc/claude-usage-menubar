@@ -562,6 +562,30 @@ def rolled_over(row, fetched_at):
     return reset_at <= time.time() and fetched_at < reset_at
 
 
+def unanchored(row):
+    """True when a row carries no window boundary at all.
+
+    A session nobody is in comes back as `percent: 0` with `resets_at: null`:
+    there is no window, so there is no clock to compare against and
+    rolled_over() cannot see anything. While the reading is fresh that is
+    simply the truth, and 0 is the right thing to show. Once it is stale it
+    becomes unknowable -- a session started since would have opened a window we
+    never saw, and the 0 we are holding describes only the quiet before it.
+    """
+    return parse_ts(row.get("resets_at")) is None
+
+
+def unreliable(row, fetched_at, age):
+    """The two ways a figure stops describing anything we can stand behind:
+    its window ended while we were blind, or it never named a window and has
+    since gone stale. Kept in one place because the icon, the tooltip and the
+    menu must agree -- a `--` in the icon beside a number in the menu is worse
+    than either alone."""
+    if rolled_over(row, fetched_at):
+        return True
+    return unanchored(row) and (age is None or age > ICON_STALE_AFTER_SECONDS)
+
+
 def credentials():
     """Returns (access_token, plan).
 
@@ -1282,7 +1306,7 @@ class Tray:
         stale = age is None or age > ICON_STALE_AFTER_SECONDS
         out = []
         for r in chosen:
-            if rolled_over(r, fetched_at):
+            if unreliable(r, fetched_at, age):
                 # The window this figure counted has ended. Zero would be the
                 # tempting guess, and the wrong one: it invites you to spend a
                 # session you may have spent already. We do not know, so the
@@ -1310,8 +1334,9 @@ class Tray:
             return sanitize(redact(detail or "no data yet"), limit=127)
         lines = []
         fetched_at = self.fetched_at()
+        age = self.age()
         for row in collect_limits(data):
-            if rolled_over(row, fetched_at):
+            if unreliable(row, fetched_at, age):
                 lines.append(f"{row['label']}  --  awaiting refresh")
                 continue
             span = compact_duration(seconds_until(row["resets_at"]))
@@ -1324,7 +1349,6 @@ class Tray:
             chip = credit_chip(spend)
             if chip:
                 lines.append(f"Credits  {chip}")
-        age = self.age()
         if age is None or age > STALE_AFTER_SECONDS:
             lines.append("(figures stale)")
         return "\n".join(lines)[:127]
@@ -1385,13 +1409,14 @@ class Tray:
             self.clear_local_backoff(hard=True)
 
     def check_rollover(self):
-        """A window that ended while we were blind is the one case where
-        sitting out a backoff achieves nothing: the number on screen counts a
-        window nobody is in, and no amount of waiting improves it. Hold our own
+        """A figure we can no longer stand behind is the one case where sitting
+        out a backoff achieves nothing: it counts a window nobody is in, or
+        none we ever saw, and no amount of waiting improves it. Hold our own
         penalty down to the ordinary poll interval until a fetch lands."""
         fetched_at = self.fetched_at()
+        age = self.age()
         rows = collect_limits(self.data() or {})
-        if any(rolled_over(row, fetched_at) for row in rows):
+        if any(unreliable(row, fetched_at, age) for row in rows):
             self.clear_local_backoff(hard=False)
 
     def maybe_fetch(self, force=False):
@@ -1518,12 +1543,20 @@ class Tray:
         # as things to click.
         width = max([len(r["label"]) for r in rows] + [len("Extra credits")])
         fetched_at = self.fetched_at()
+        age = self.age()
         for row in rows:
             if rolled_over(row, fetched_at):
                 when = parse_ts(row["resets_at"]).astimezone()
                 label = (
                     f"{row['label']:<{width}}   {'--':>3}    window ended "
                     f"{when:%H:%M}, awaiting refresh"
+                )
+            elif unreliable(row, fetched_at, age):
+                # No window to name, so nothing to date it against: say what
+                # we actually last saw rather than dressing 0 up as current.
+                label = (
+                    f"{row['label']:<{width}}   {'--':>3}    "
+                    "no window open when last seen"
                 )
             else:
                 label = f"{row['label']:<{width}}   {round(row['percent']):>3}%"
@@ -1550,7 +1583,6 @@ class Tray:
         # again, close the same block. One uninterrupted section: it is all
         # about the current reading. Settings, which change behaviour rather
         # than report it, are the separate concern below the divider.
-        age = self.age()
         if age is None:
             stamp = "No successful fetch yet"
         else:
