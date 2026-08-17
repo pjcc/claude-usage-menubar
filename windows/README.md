@@ -177,11 +177,38 @@ Also worth knowing:
 | Path | |
 |---|---|
 | `%LOCALAPPDATA%\claude-usage-tray\config.json` | Settings |
-| `%LOCALAPPDATA%\claude-usage-tray\cache.json` | Cached usage, backoff state |
+| `%LOCALAPPDATA%\claude-usage-tray\cache.json` | Cached usage, and the evidence pacing is worked out from |
+| `%LOCALAPPDATA%\claude-usage-tray\log.jsonl` | One line per attempt, capped at 256KB. See below |
 | `%LOCALAPPDATA%\claude-usage-tray\statusline` | One-line sidecar for a Claude Code statusline that wants the credit figure without a network call |
 | `%LOCALAPPDATA%\claude-usage-tray\ClaudeUsage.exe`, `pyvenv.cfg` | The rebranded interpreter it runs under, see above |
 
 Deleting any of them is safe; they are rebuilt on the next poll or the next start.
+
+## The log
+
+Every attempt writes one JSON line to `log.jsonl`, always on. It is not a debug switch
+because the faults worth diagnosing here are days apart and never reproducible on
+demand, so a log you have to have enabled in advance is a log you will not have. At a
+poll every 90s it is a few hundred KB a week, and it is truncated to its last 192KB
+once it passes 256KB.
+
+```
+{"at": "2026-08-17 23:04:02", "event": "fetch", "forced": false, "ok": true,
+ "error": null, "fails": 0, "asked": null, "next_in": 87, "rows": {"S": 33, "W": 9}}
+```
+
+`next_in` is the field that matters: it is what the tray decided to do next, recorded
+beside the evidence it decided from. `asked` is the `Retry-After` header verbatim,
+which is the thing that was missing when a fifteen-minute lockout appeared with the
+failure count still at one and there was no way to tell what the server had actually
+sent. A `start` line records what the cache handed back on launch, which is where a
+count surviving a power cycle would show up.
+
+To read the last few:
+
+```powershell
+Get-Content "$env:LOCALAPPDATA\claude-usage-tray\log.jsonl" -Tail 20
+```
 
 ## Uninstall
 
