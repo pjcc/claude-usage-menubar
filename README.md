@@ -39,7 +39,7 @@ same endpoint Claude Code's `/usage` command uses.
 withdrawn without notice. If that happens, both degrade to a dim placeholder with the
 reason in the menu rather than breaking your menu bar or taskbar.
 
-### Refresh: 10s on screen, at most once a minute on the wire
+### Refresh: 10s on screen, at most once every 90s on the wire
 
 **The budget is shared with Claude Code**, which polls the same endpoint for its own
 limit display. Measured by stopping the tray, sitting completely idle for six minutes
@@ -81,11 +81,17 @@ fetching are therefore separate:
   countdown tick in seconds
 - the network is touched **at most once every 90 seconds**, and only when not already
   backing off
-- failures back off **exponentially**: 60s, doubling per consecutive failure. The
-  ceiling depends on who failed. A server that answered gets **fifteen minutes**, which
-  is also the most that will be taken from a `retry-after`. A failure on this machine -
-  no DNS, no route, a timeout - never reached the server, so nobody asked us to stay
-  away: those cap at **five minutes**
+- failures back off **exponentially** from the poll interval: 90s, doubling per
+  consecutive failure. The ceiling depends on who failed. A server that answered gets
+  **fifteen minutes**, which is also the most that will be taken from a `retry-after`,
+  in either of the two forms RFC 9110 allows for it. A failure on this machine - no DNS,
+  no route, a timeout - never reached the server, so nobody asked us to stay away: those
+  cap at **five minutes**. So the ladders are 90, 180, 360, 720, 900 against the server
+  and 90, 180, 300 against ourselves
+- **a wait read back off disk is capped at fifteen minutes**, that being the longest one
+  this code can produce. Anything further out arrived by some other route - a clock that
+  moved, a restored file - and left alone it would stop the polling with nothing on
+  screen able to account for it
 - **a hand-driven refresh ignores every one of those**, the server's `retry-after`
   included, and has no floor of its own. All of it paces *polling*, and clicking Refresh
   now is overruling exactly that. The only moment the item is withheld is while a
@@ -94,6 +100,15 @@ fetching are therefore separate:
 - recovery is **triggered, not just waited out**. Waking from sleep resets the penalty
   outright, and a usage window that ended while we were offline holds it down to the
   ordinary poll interval
+- **a penalty never outlives the machine that earned it.** A backoff is an undertaking
+  to try again at a stated moment, so silence well past that moment means nothing was
+  running to make the attempt: the machine was off, asleep, or this is the first run.
+  The failure count is dropped in that case rather than read back off disk, because
+  otherwise the first refusal after a cold boot lands on a ceiling built out of
+  yesterday's network. It is also the only wake detection the macOS build can have -
+  SwiftBar starts a fresh process every tick, so the clock is the only thing that
+  carries across. A wait the *server* asked for is still honoured, it having been
+  addressed to the account rather than to the process
 - reset countdowns are recomputed **locally** on every render, so they stay accurate
   between polls
 - percentages come from cache, and are flagged once genuinely stale. If a window rolled
@@ -129,6 +144,17 @@ windows/   notification-area app, and its README
 
 The two deliberately share no code. Each is meant to be a single self-contained file,
 and on macOS a shared module could not sit beside the plugin anyway: SwiftBar treats
-every file in its plugin directory as a plugin and would try to execute it. What is
-duplicated is about two hundred lines of pure formatting helpers with no reason to
-change.
+every file in its plugin directory as a plugin and would try to execute it.
+
+**What is duplicated is not only formatting.** It includes the whole rate-limit policy -
+`retry_after_seconds`, `backoff_for`, `sane_cache`, `unattended`, `rolled_over`,
+`unanchored`, `unreliable`, `collect_limits`, and the block that decides contention from
+a genuine lockout - which is precisely the part that keeps changing. **A change to any of
+it has to be made twice.** The two builds are kept honest by name: the same functions
+take the same arguments in the same order, so a missing edit shows up as a diff of
+function bodies rather than having to be reasoned about.
+
+The exception, and the one that has actually bitten, is behaviour that exists under
+different names on the two sides - Windows forcing a refresh through `maybe_fetch`,
+macOS through `force_refresh`. Those have no counterpart to diff against, so they need
+checking by hand.
