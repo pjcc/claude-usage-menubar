@@ -107,6 +107,11 @@ UNCOLOURED_AFTER_SECONDS = 900
 # very next request a minute later.
 MAX_BACKOFF_SECONDS = 900
 MAX_LOCAL_BACKOFF_SECONDS = 300
+# Silence longer than this past a poll we owed means nothing was running to
+# make it -- see unattended(). Roughly two missed ticks either side of the
+# poll interval, generous enough that a busy machine running late never trips
+# it and short enough to catch a lid closed over lunch.
+RESUME_GAP_SECONDS = 120
 
 LOGIN_LABEL = "com.ameba.SwiftBar"
 LOGIN_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LOGIN_LABEL}.plist")
@@ -389,6 +394,30 @@ def backoff_for(fails, err=None):
     except (TypeError, ValueError, AttributeError):
         pass
     return min(wait, MAX_BACKOFF_SECONDS)
+
+
+def unattended(cache, now):
+    """True when time has passed that nothing of ours was running for.
+
+    A backoff is a promise to try again at a stated moment. When that moment is
+    well behind us and no attempt was ever made, nothing was there to make it:
+    the machine was off or asleep, or this is the first tick since. So the
+    failures that set the penalty were judging a network from hours ago, and
+    carrying their count across means the first refusal after waking lands on a
+    ceiling it never earned -- fifteen minutes of `--` bought by conditions
+    that no longer exist.
+
+    This is the only wake detection this build can have. SwiftBar starts a
+    fresh process every tick, so there is no timer of ours to stop ticking and
+    nothing in memory to compare against; the clock is all that carries across.
+    """
+    last = cache.get("last_attempt", 0)
+    if not last:
+        return False
+    # The moment we undertook to try again -- a backoff if one was set, the
+    # ordinary poll otherwise. Silence past it means nobody was listening.
+    due = max(cache.get("backoff_until", 0), last + MIN_FETCH_SECONDS)
+    return now - due > RESUME_GAP_SECONDS
 
 
 def rolled_over(row, fetched_at):
@@ -824,6 +853,12 @@ def main():
     # ever saw, and no amount of waiting improves it. Hold our own penalty --
     # never the server's -- down to the ordinary poll interval until a fetch
     # lands.
+    # Woken, booted, or newly installed: the penalty on disk was earned by a
+    # machine that is no longer the one running, so the doubling starts over.
+    # The server's own wait still stands, and has usually expired by itself.
+    if unattended(cache, now) and now >= cache.get("server_backoff_until", 0):
+        cache["fails"] = 0
+        cache["backoff_until"] = 0
     cached = cache.get("data") if isinstance(cache.get("data"), dict) else {}
     cached_at = cache.get("fetched_at", 0)
     cached_age = now - cached_at if cached_at else None

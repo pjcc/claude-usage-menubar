@@ -94,6 +94,15 @@ fetching are therefore separate:
 - recovery is **triggered, not just waited out**. Waking from sleep resets the penalty
   outright, and a usage window that ended while we were offline holds it down to the
   ordinary poll interval
+- **a penalty never outlives the machine that earned it.** A backoff is an undertaking
+  to try again at a stated moment, so silence well past that moment means nothing was
+  running to make the attempt: the machine was off, asleep, or this is the first run.
+  The failure count is dropped in that case rather than read back off disk, because
+  otherwise the first refusal after a cold boot lands on a ceiling built out of
+  yesterday's network. It is also the only wake detection the macOS build can have -
+  SwiftBar starts a fresh process every tick, so the clock is the only thing that
+  carries across. A wait the *server* asked for is still honoured, it having been
+  addressed to the account rather than to the process
 - reset countdowns are recomputed **locally** on every render, so they stay accurate
   between polls
 - percentages come from cache, and are flagged once genuinely stale. If a window rolled

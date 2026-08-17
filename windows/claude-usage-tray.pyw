@@ -547,6 +547,30 @@ def backoff_for(fails, err=None):
     return min(wait, MAX_BACKOFF_SECONDS)
 
 
+def unattended(cache, now):
+    """True when time has passed that nothing of ours was running for.
+
+    A backoff is a promise to try again at a stated moment. When that moment is
+    well behind us and no attempt was ever made, nothing was there to make it:
+    the machine was off, or suspended, or this is the first run since. So the
+    failures that set the penalty were judging a network from hours ago, and
+    carrying their count across means the first refusal after a cold start
+    lands on a ceiling it never earned -- fifteen minutes of `--` bought by
+    conditions that no longer exist.
+
+    check_resume() reads a suspend off a timer that stopped ticking, but a
+    power cycle leaves no gap to see: the process is new and the count comes
+    back off disk. Reading it from the clock instead covers both.
+    """
+    last = cache.get("last_attempt", 0)
+    if not last:
+        return False
+    # The moment we undertook to try again -- a backoff if one was set, the
+    # ordinary poll otherwise. Silence past it means nobody was listening.
+    due = max(cache.get("backoff_until", 0), last + MIN_FETCH_SECONDS)
+    return now - due > RESUME_GAP_SECONDS
+
+
 def rolled_over(row, fetched_at):
     """True when this row's window ended after our last good fetch.
 
@@ -1189,6 +1213,11 @@ class Tray:
         self.lock = threading.Lock()
         self.fetching = False
         self.last_tick = time.time()
+        # A cold start is a resume nobody was running to notice, and the cache
+        # hands back the failure count from before it. Same reasoning as
+        # check_resume(), applied to the one case it cannot see.
+        if unattended(self.cache, self.last_tick):
+            self.clear_local_backoff(hard=True)
         self.icon = None
         self.hwnd = None
         self.size = max(user32.GetSystemMetrics(49), 16)  # SM_CXSMICON
