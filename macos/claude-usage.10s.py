@@ -14,8 +14,8 @@
 #
 # The filename sets how often SwiftBar re-renders (10s). That drives the
 # *display* only, so the retry countdown ticks in seconds. The network is
-# touched at most once a minute and backs off exponentially on failure --
-# see MIN_FETCH_SECONDS and backoff_for().
+# touched at most once every 90 seconds and backs off exponentially on
+# failure -- see MIN_FETCH_SECONDS and backoff_for().
 #
 # Self-invoking actions (driven by the dropdown):
 #   --toggle-credits   flip the credits chip on/off in the menu bar
@@ -23,7 +23,11 @@
 #   --toggle-login     add/remove the launch-at-login agent
 #   --force-refresh    clear the local throttle so the next render fetches
 
+import contextlib
+import email.utils
+import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -72,11 +76,11 @@ GREEN = 40
 AMBER = 220
 RED = 196
 
-# The usage endpoint rate-limits aggressively (observed: HTTP 429 with
-# retry-after ~275s after roughly a dozen calls). So the plugin's refresh
-# cadence drives the *display* only -- percentages come from cache and the
-# reset countdowns are recomputed locally on every tick, while the network is
-# touched at most once a minute and backs off when told to.
+# The usage endpoint rate-limits aggressively, so the plugin's refresh cadence
+# drives the *display* only -- percentages come from cache and the reset
+# countdowns are recomputed locally on every tick, while the network is touched
+# at most once every 90 seconds and backs off when told to.
+#
 # Measured 2026-08-07: the endpoint allows five calls, refuses the sixth, and
 # stays shut for 300s. Probes at +30s, +60s and +91s were all still refused, so
 # the budget does not trickle back a call at a time -- overshooting costs the
@@ -89,8 +93,10 @@ RED = 196
 # little anyway: the percentages move slowly, and the countdowns beside them
 # are recomputed locally every ten seconds regardless of when we last fetched.
 MIN_FETCH_SECONDS = 90
-# Roughly two missed polls, which is what this has always meant.
-STALE_AFTER_SECONDS = 240
+# Two missed polls, which is what this has always meant. It was 240 back when
+# a poll was 60s; the interval moved to 90 and this did not follow, which left
+# it tripping at 2.7 polls and calling contention a fault sooner than intended.
+STALE_AFTER_SECONDS = 270
 # The title flags staleness early because a discreet marker costs nothing.
 # Dropping the colour is louder, so it waits until the age is beyond
 # explaining away by a missed poll or two.
@@ -373,6 +379,34 @@ def toggle_color():
 # --------------------------------------------------------------------------
 
 
+def retry_after_seconds(headers):
+    """How long the server asked us to wait, in seconds, or 0 if it did not.
+
+    RFC 9110 allows either a count of seconds or an HTTP-date, and this
+    endpoint has only ever sent the first. Reading a date as "no answer" would
+    file a genuine lockout under contention and retry it every ninety seconds,
+    so both forms are read. Neither is trusted further than
+    MAX_BACKOFF_SECONDS: this is the header seen asking for a full hour and
+    then serving the very next request a minute later.
+    """
+    value = (headers or {}).get("retry-after")
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return 0
+    if when is None:
+        return 0
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0, int(when.timestamp() - time.time()))
+
+
 def backoff_for(fails, err=None):
     """Seconds to wait after a failed attempt.
 
@@ -389,11 +423,39 @@ def backoff_for(fails, err=None):
     wait = MIN_FETCH_SECONDS * (2 ** min(fails - 1, 8))
     if err is None:
         return min(wait, MAX_LOCAL_BACKOFF_SECONDS)
-    try:
-        wait = max(wait, int(err.headers.get("retry-after") or 0))
-    except (TypeError, ValueError, AttributeError):
-        pass
-    return min(wait, MAX_BACKOFF_SECONDS)
+    return min(max(wait, retry_after_seconds(getattr(err, "headers", None))),
+               MAX_BACKOFF_SECONDS)
+
+
+def sane_cache(cache, now):
+    """Bring a cache we did not necessarily write into range.
+
+    Every field here is either compared against the clock or added to, so one
+    of the wrong type stops the plugin rather than degrading it -- and the two
+    waits have a ceiling this code could not have exceeded. A backoff further
+    out than MAX_BACKOFF_SECONDS was not written by us: the clock moved, or the
+    file was restored or hand-edited. Capped rather than dropped, because a
+    server wait may genuinely still be owed and fifteen minutes is the longest
+    one we would ever have agreed to. unattended() cannot catch this on its
+    own, since a future backoff reads as a promise still owed -- which is right
+    in every case but this one.
+
+    Timestamps get a different ceiling: nothing was fetched in the future, and
+    a fetched_at ahead of now makes the figures look permanently fresh.
+    """
+    for key, ceiling in (("backoff_until", now + MAX_BACKOFF_SECONDS),
+                         ("server_backoff_until", now + MAX_BACKOFF_SECONDS),
+                         ("last_attempt", now),
+                         ("fetched_at", now)):
+        value = cache.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            cache[key] = 0
+        elif value > ceiling:
+            cache[key] = ceiling
+    fails = cache.get("fails")
+    if isinstance(fails, bool) or not isinstance(fails, int) or fails < 0:
+        cache["fails"] = 0
+    return cache
 
 
 def unattended(cache, now):
@@ -570,7 +632,8 @@ def money(amount, compact=False):
     if not isinstance(amount, dict):
         return None
     minor = amount.get("amount_minor")
-    if minor is None:
+    # Same reasoning as as_percent(): this goes straight into arithmetic.
+    if isinstance(minor, bool) or not isinstance(minor, (int, float)):
         return None
     currency = amount.get("currency", "")
     exponent = amount.get("exponent", 2)
@@ -583,19 +646,56 @@ def money(amount, compact=False):
     return f"{symbol}{minor / scale:.{exponent}f}"
 
 
+def as_percent(value):
+    """A percentage we can compare and round, or None if it is neither.
+
+    Numeric strings are accepted: the endpoint sends numbers today, but it is
+    undocumented and already changed shape once this month, and "14" is a
+    change we can still render correctly rather than one worth going blind
+    over. Anything non-finite is refused -- NaN compares false against every
+    threshold, and round() raises on both it and infinity.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = value
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+    return number if math.isfinite(number) else None
+
+
+def as_severity(value):
+    """The server's own severity, or 'normal' when it did not send a usable
+    one. Kept as a function because an unhashable value -- an object where a
+    string was expected -- raises on the dict lookups it feeds rather than
+    missing them."""
+    return value if isinstance(value, str) else "normal"
+
+
 def collect_limits(data):
-    """Prefer the structured `limits` array; fall back to the flat fields."""
+    """Prefer the structured `limits` array; fall back to the flat fields.
+
+    A row is kept only when its percentage is arithmetic. Everything
+    downstream -- the colour thresholds, the chips, the dropdown -- assumes
+    that, and this is the last boundary where it can still be checked.
+    """
     rows = []
     for entry in data.get("limits") or []:
-        if not isinstance(entry, dict) or entry.get("percent") is None:
+        if not isinstance(entry, dict):
+            continue
+        percent = as_percent(entry.get("percent"))
+        if percent is None:
             continue
         tag, label = meta_for(entry.get("kind", ""))
         rows.append(
             {
                 "tag": tag,
                 "label": label,
-                "percent": entry["percent"],
-                "severity": entry.get("severity") or "normal",
+                "percent": percent,
+                "severity": as_severity(entry.get("severity")),
                 "resets_at": entry.get("resets_at"),
             }
         )
@@ -603,17 +703,21 @@ def collect_limits(data):
         return rows
     for key, kind in (("five_hour", "session"), ("seven_day", "weekly_all")):
         block = data.get(key)
-        if isinstance(block, dict) and block.get("utilization") is not None:
-            tag, label = meta_for(kind)
-            rows.append(
-                {
-                    "tag": tag,
-                    "label": label,
-                    "percent": block["utilization"],
-                    "severity": "normal",
-                    "resets_at": block.get("resets_at"),
-                }
-            )
+        if not isinstance(block, dict):
+            continue
+        percent = as_percent(block.get("utilization"))
+        if percent is None:
+            continue
+        tag, label = meta_for(kind)
+        rows.append(
+            {
+                "tag": tag,
+                "label": label,
+                "percent": percent,
+                "severity": "normal",
+                "resets_at": block.get("resets_at"),
+            }
+        )
     return rows
 
 
@@ -631,9 +735,10 @@ def ansi_wrap(text, index):
 def alert_code(percent, severity="normal"):
     """Green below the warn threshold, then amber, then red. The server's own
     severity can escalate early -- whichever trips first wins."""
-    if percent >= COLOR_ALERT_AT or SEVERITY_RANK.get(severity, 0) >= 2:
+    rank = SEVERITY_RANK.get(as_severity(severity), 0)
+    if percent >= COLOR_ALERT_AT or rank >= 2:
         return RED
-    if percent >= COLOR_WARN_AT or SEVERITY_RANK.get(severity, 0) == 1:
+    if percent >= COLOR_WARN_AT or rank == 1:
         return AMBER
     return GREEN
 
@@ -710,7 +815,8 @@ def render(data, plan, config, age=None, error=None, backoff_until=0, fetched_at
                 chip = ansi_wrap(
                     chip,
                     alert_code(
-                        spend.get("percent") or 0, spend.get("severity") or "normal"
+                        as_percent(spend.get("percent")) or 0,
+                        as_severity(spend.get("severity")),
                     ),
                 )
             chips.append(chip)
@@ -754,9 +860,9 @@ def render(data, plan, config, age=None, error=None, backoff_until=0, fetched_at
 
     used, limit = money(spend.get("used")), money(spend.get("limit"))
     if spend.get("enabled") and used and limit:
-        percent = spend.get("percent")
+        percent = as_percent(spend.get("percent"))
         suffix = f"   {round(percent)}% used" if percent is not None else ""
-        row_color = SEVERITY_COLOR.get(spend.get("severity") or "normal")
+        row_color = SEVERITY_COLOR.get(as_severity(spend.get("severity")))
         print(
             f"{'Extra credits':<{width}}  {used} of {limit}{suffix} | {MONO}"
             + (f" color={row_color}" if row_color else "")
@@ -843,8 +949,8 @@ def main():
         config["login_initialised"] = True
         save_config(config)
 
-    cache = load_cache()
     now = time.time()
+    cache = sane_cache(load_cache(), now)
     # last_attempt gates the network; fetched_at records when data was last good.
     # Keeping them separate matters: a failed attempt must not make the cached
     # figures look fresh, and must not make them look infinitely stale either.
@@ -874,11 +980,21 @@ def main():
 
     if due and not blocked:
         cache["last_attempt"] = now
+        # Claim the slot on disk *before* the request, not after it. SwiftBar
+        # starts a fresh process every tick and every one of them reads this
+        # file: for as long as the claim lives only in our own memory, each
+        # tick landing mid-request sees the old timestamp, agrees a poll is
+        # due, and sends one of its own. The window is the keychain read plus
+        # the request, both of which can run to TIMEOUT, against a tick every
+        # ten seconds -- so a slow endpoint drew *more* traffic from us rather
+        # than less, which is the opposite of what the whole throttle is for.
+        save_cache(cache)
         try:
             access_token, plan = credentials()
+            payload = fetch(access_token)
             cache.update(
                 {
-                    "data": fetch(access_token),
+                    "data": payload,
                     "plan": plan,
                     "fetched_at": now,
                     "backoff_until": 0,
@@ -887,13 +1003,16 @@ def main():
                     "fails": 0,
                 }
             )
-            write_statusline_sidecar(cache["data"])
-        except urllib.error.HTTPError as err:
-            headers = getattr(err, "headers", None)
+            # A convenience for the statusline, and never a reason to call a
+            # good fetch a failure: its own formatting can raise on spend data
+            # we did not expect, and that would otherwise land in the handler
+            # below -- discarding a healthy 200 and imposing a backoff on it.
             try:
-                asked = int((headers or {}).get("retry-after") or 0)
-            except (TypeError, ValueError):
-                asked = 0
+                write_statusline_sidecar(payload)
+            except Exception:  # noqa: BLE001
+                pass
+        except urllib.error.HTTPError as err:
+            asked = retry_after_seconds(getattr(err, "headers", None))
             if err.code == 429 and asked <= 0:
                 # Contention, not a fault. This endpoint's budget is shared
                 # with Claude Code, which polls it too, so being turned away is
@@ -936,15 +1055,32 @@ def main():
 
     fetched_at = cache.get("fetched_at", 0)
     age = now - fetched_at if fetched_at else None
-    render(
-        data,
-        cache.get("plan") or "",
-        config,
-        age,
-        cache.get("error"),
-        cache.get("backoff_until", 0),
-        fetched_at,
-    )
+    # The same guarantee the Windows build makes at its callback boundary, and
+    # for the same reason: the endpoint is undocumented and can change shape
+    # under us, and a traceback in the menu bar is the one outcome worse than a
+    # placeholder. Rendered into a buffer first so a failure part-way through
+    # cannot leave half a menu on screen -- SwiftBar reads everything above the
+    # first separator as the title, so partial output is not merely untidy.
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            render(
+                data,
+                cache.get("plan") or "",
+                config,
+                age,
+                cache.get("error"),
+                cache.get("backoff_until", 0),
+                fetched_at,
+            )
+    except Exception as err:  # noqa: BLE001 - never let the menu bar break
+        fail(
+            redact(err) or err.__class__.__name__,
+            config,
+            cache.get("backoff_until", 0),
+        )
+    else:
+        sys.stdout.write(buffer.getvalue())
 
 
 if __name__ == "__main__":

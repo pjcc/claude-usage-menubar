@@ -28,7 +28,9 @@ no console window appears.
 
 import ctypes
 import ctypes.wintypes as w
+import email.utils
 import json
+import math
 import os
 import re
 import shutil
@@ -104,8 +106,10 @@ MUTED = (138, 138, 142)
 # little anyway: the percentages move slowly, and the countdowns beside them
 # are recomputed locally every ten seconds regardless of when we last fetched.
 MIN_FETCH_SECONDS = 90
-# Roughly two missed polls, which is what this has always meant.
-STALE_AFTER_SECONDS = 240
+# Two missed polls, which is what this has always meant. It was 240 back when
+# a poll was 60s; the interval moved to 90 and this did not follow, which left
+# it tripping at 2.7 polls and calling contention a fault sooner than intended.
+STALE_AFTER_SECONDS = 270
 # The tooltip flags staleness early because you had to hover to read it. The
 # icon is glanced at, so it only dims once the age is beyond explaining away
 # by a missed poll or two -- at which point the figure is not a live reading.
@@ -523,6 +527,34 @@ def set_pinned(pin):
 # --------------------------------------------------------------------------
 
 
+def retry_after_seconds(headers):
+    """How long the server asked us to wait, in seconds, or 0 if it did not.
+
+    RFC 9110 allows either a count of seconds or an HTTP-date, and this
+    endpoint has only ever sent the first. Reading a date as "no answer" would
+    file a genuine lockout under contention and retry it every ninety seconds,
+    so both forms are read. Neither is trusted further than
+    MAX_BACKOFF_SECONDS: this is the header seen asking for a full hour and
+    then serving the very next request a minute later.
+    """
+    value = (headers or {}).get("retry-after")
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return 0
+    if when is None:
+        return 0
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0, int(when.timestamp() - time.time()))
+
+
 def backoff_for(fails, err=None):
     """Seconds to wait after a failed attempt.
 
@@ -540,11 +572,39 @@ def backoff_for(fails, err=None):
     wait = MIN_FETCH_SECONDS * (2 ** min(fails - 1, 8))
     if err is None:
         return min(wait, MAX_LOCAL_BACKOFF_SECONDS)
-    try:
-        wait = max(wait, int(err.headers.get("retry-after") or 0))
-    except (TypeError, ValueError, AttributeError):
-        pass
-    return min(wait, MAX_BACKOFF_SECONDS)
+    return min(max(wait, retry_after_seconds(getattr(err, "headers", None))),
+               MAX_BACKOFF_SECONDS)
+
+
+def sane_cache(cache, now):
+    """Bring a cache we did not necessarily write into range.
+
+    Every field here is either compared against the clock or added to, so one
+    of the wrong type stops the tray rather than degrading it -- and the two
+    waits have a ceiling this code could not have exceeded. A backoff further
+    out than MAX_BACKOFF_SECONDS was not written by us: the clock moved, or the
+    file was restored or hand-edited. Capped rather than dropped, because a
+    server wait may genuinely still be owed and fifteen minutes is the longest
+    one we would ever have agreed to. unattended() cannot catch this on its
+    own, since a future backoff reads as a promise still owed -- which is right
+    in every case but this one.
+
+    Timestamps get a different ceiling: nothing was fetched in the future, and
+    a fetched_at ahead of now makes the figures look permanently fresh.
+    """
+    for key, ceiling in (("backoff_until", now + MAX_BACKOFF_SECONDS),
+                         ("server_backoff_until", now + MAX_BACKOFF_SECONDS),
+                         ("last_attempt", now),
+                         ("fetched_at", now)):
+        value = cache.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            cache[key] = 0
+        elif value > ceiling:
+            cache[key] = ceiling
+    fails = cache.get("fails")
+    if isinstance(fails, bool) or not isinstance(fails, int) or fails < 0:
+        cache["fails"] = 0
+    return cache
 
 
 def unattended(cache, now):
@@ -726,7 +786,8 @@ def money(amount, compact=False):
     if not isinstance(amount, dict):
         return None
     minor = amount.get("amount_minor")
-    if minor is None:
+    # Same reasoning as as_percent(): this goes straight into arithmetic.
+    if isinstance(minor, bool) or not isinstance(minor, (int, float)):
         return None
     currency = amount.get("currency", "")
     exponent = amount.get("exponent", 2)
@@ -739,19 +800,57 @@ def money(amount, compact=False):
     return f"{symbol}{minor / scale:.{exponent}f}"
 
 
+def as_percent(value):
+    """A percentage we can compare and round, or None if it is neither.
+
+    Numeric strings are accepted: the endpoint sends numbers today, but it is
+    undocumented and already changed shape once this month, and "14" is a
+    change we can still render correctly rather than one worth going blind
+    over. Anything non-finite is refused -- NaN compares false against every
+    threshold, and round() raises on both it and infinity.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = value
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+    return number if math.isfinite(number) else None
+
+
+def as_severity(value):
+    """The server's own severity, or 'normal' when it did not send a usable
+    one. Kept as a function because an unhashable value -- an object where a
+    string was expected -- raises on the dict lookups it feeds rather than
+    missing them."""
+    return value if isinstance(value, str) else "normal"
+
+
 def collect_limits(data):
-    """Prefer the structured `limits` array; fall back to the flat fields."""
+    """Prefer the structured `limits` array; fall back to the flat fields.
+
+    A row is kept only when its percentage is arithmetic. Everything
+    downstream -- the colour thresholds, the digits drawn into the icon, the
+    tooltip, the menu -- assumes that, and this is the last boundary where it
+    can still be checked.
+    """
     rows = []
     for entry in data.get("limits") or []:
-        if not isinstance(entry, dict) or entry.get("percent") is None:
+        if not isinstance(entry, dict):
+            continue
+        percent = as_percent(entry.get("percent"))
+        if percent is None:
             continue
         tag, label = meta_for(entry.get("kind", ""))
         rows.append(
             {
                 "tag": tag,
                 "label": label,
-                "percent": entry["percent"],
-                "severity": entry.get("severity") or "normal",
+                "percent": percent,
+                "severity": as_severity(entry.get("severity")),
                 "resets_at": entry.get("resets_at"),
             }
         )
@@ -759,26 +858,31 @@ def collect_limits(data):
         return rows
     for key, kind in (("five_hour", "session"), ("seven_day", "weekly_all")):
         block = data.get(key)
-        if isinstance(block, dict) and block.get("utilization") is not None:
-            tag, label = meta_for(kind)
-            rows.append(
-                {
-                    "tag": tag,
-                    "label": label,
-                    "percent": block["utilization"],
-                    "severity": "normal",
-                    "resets_at": block.get("resets_at"),
-                }
-            )
+        if not isinstance(block, dict):
+            continue
+        percent = as_percent(block.get("utilization"))
+        if percent is None:
+            continue
+        tag, label = meta_for(kind)
+        rows.append(
+            {
+                "tag": tag,
+                "label": label,
+                "percent": percent,
+                "severity": "normal",
+                "resets_at": block.get("resets_at"),
+            }
+        )
     return rows
 
 
 def alert_code(percent, severity="normal"):
     """Green below the warn threshold, then amber, then red. The server's own
     severity can escalate early -- whichever trips first wins."""
-    if percent >= COLOR_ALERT_AT or SEVERITY_RANK.get(severity, 0) >= 2:
+    rank = SEVERITY_RANK.get(as_severity(severity), 0)
+    if percent >= COLOR_ALERT_AT or rank >= 2:
         return RED
-    if percent >= COLOR_WARN_AT or SEVERITY_RANK.get(severity, 0) == 1:
+    if percent >= COLOR_WARN_AT or rank == 1:
         return AMBER
     return GREEN
 
@@ -1209,10 +1313,10 @@ def make_icon(rows, size):
 class Tray:
     def __init__(self):
         self.config = read_json(CONFIG_PATH)
-        self.cache = read_json(CACHE_PATH)
         self.lock = threading.Lock()
         self.fetching = False
         self.last_tick = time.time()
+        self.cache = sane_cache(read_json(CACHE_PATH), self.last_tick)
         # A cold start is a resume nobody was running to notice, and the cache
         # hands back the failure count from before it. Same reasoning as
         # check_resume(), applied to the one case it cannot see.
@@ -1359,7 +1463,7 @@ class Tray:
         than the menu's fully spelled-out one."""
         data = self.data()
         if not data:
-            detail = status_line(self.cache.get("error"), self.cache.get("backoff_until", 0))
+            detail = status_line(*self.status())
             return sanitize(redact(detail or "no data yet"), limit=127)
         lines = []
         fetched_at = self.fetched_at()
@@ -1406,6 +1510,20 @@ class Tray:
     def age(self):
         fetched_at = self.fetched_at()
         return time.time() - fetched_at if fetched_at else None
+
+    def status(self):
+        """The error and the wait it belongs to, read together.
+
+        fetch_now applies its result as one dict.update, which is not atomic
+        across keys: read separately, a menu drawn at the wrong instant can
+        pair a new error with the old wait and show a countdown that never
+        was. Cheap to take them under the same lock as everything else."""
+        with self.lock:
+            return self.cache.get("error"), self.cache.get("backoff_until", 0)
+
+    def plan(self):
+        with self.lock:
+            return sanitize(self.cache.get("plan") or "", limit=24)
 
     def clear_local_backoff(self, hard):
         """Drop the penalty we imposed on ourselves, never the one the server
@@ -1471,6 +1589,14 @@ class Tray:
             if force:
                 self.fetching = True
                 self.cache["last_attempt"] = now
+                # A person clicking is not a poll, and the failures of one are
+                # not the other's to inherit. Without this, five failed clicks
+                # during an outage walk the count to the ceiling and leave the
+                # *automatic* poll sitting out a quarter of an hour it never
+                # earned -- the control that exists to escape a wait, buying
+                # you a longer one. The Mac build's force_refresh() has always
+                # cleared the count for the same reason.
+                self.cache["fails"] = 0
             else:
                 if now - self.cache.get("last_attempt", 0) < MIN_FETCH_SECONDS:
                     return "Polled recently."
@@ -1492,26 +1618,39 @@ class Tray:
             return self.fetching
 
     def fetch_now(self):
+        """Run one attempt on the worker thread and record what it did.
+
+        `fetching` is cleared here and nowhere else, so the recording is a
+        `finally` and even the failure handlers have a handler above them. An
+        exception escaping this method would end the thread with the flag
+        still set, after which maybe_fetch answers every poll and every click
+        with "a refresh is already running" for the life of the process --
+        a tray that looks alive and has quietly stopped asking.
+        """
         now = time.time()
+        update = {}
+        try:
+            update = self.attempt(now)
+        except Exception as err:  # noqa: BLE001 - a handler itself failed
+            update = {
+                "error": redact(err) or err.__class__.__name__,
+                "backoff_until": now + MIN_FETCH_SECONDS,
+            }
+        finally:
+            with self.lock:
+                self.cache.update(update)
+                self.fetching = False
+                snapshot = dict(self.cache)
+            write_json(CACHE_PATH, snapshot)
+            user32.PostMessageW(self.hwnd, WM_FETCHED, 0, 0)
+
+    def attempt(self, now):
+        """One request, reduced to the cache fields it changes."""
         try:
             access_token, plan = credentials()
             payload = fetch(access_token)
-            update = {
-                "data": payload,
-                "plan": plan,
-                "fetched_at": now,
-                "backoff_until": 0,
-                "server_backoff_until": 0,
-                "error": None,
-                "fails": 0,
-            }
-            write_statusline_sidecar(payload)
         except urllib.error.HTTPError as err:
-            headers = getattr(err, "headers", None)
-            try:
-                asked = int((headers or {}).get("retry-after") or 0)
-            except (TypeError, ValueError):
-                asked = 0
+            asked = retry_after_seconds(getattr(err, "headers", None))
             if err.code == 429 and asked <= 0:
                 # Contention, not a fault. This endpoint's budget is shared
                 # with Claude Code, which polls it too, so being turned away
@@ -1525,41 +1664,51 @@ class Tray:
                 # A 429 that names a wait is different, and falls through.
                 with self.lock:
                     stale = self.cache.get("fetched_at", 0) < now - STALE_AFTER_SECONDS
-                update = {
+                return {
                     "error": "rate limited" if stale else None,
                     "backoff_until": now + MIN_FETCH_SECONDS,
                     "server_backoff_until": 0,
                 }
-            else:
-                with self.lock:
-                    fails = self.cache.get("fails", 0) + 1
-                wait = backoff_for(fails, err)
-                update = {
-                    "fails": fails,
-                    "error": (
-                        "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
-                    ),
-                    "backoff_until": now + wait,
-                    # Only an answer naming a wait is the server asking for
-                    # room; anything else is a failure we merely recorded.
-                    "server_backoff_until": now + wait if asked > 0 else 0,
-                }
+            with self.lock:
+                fails = self.cache.get("fails", 0) + 1
+            wait = backoff_for(fails, err)
+            return {
+                "fails": fails,
+                "error": (
+                    "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
+                ),
+                "backoff_until": now + wait,
+                # Only an answer naming a wait is the server asking for room;
+                # anything else is a failure we merely recorded.
+                "server_backoff_until": now + wait if asked > 0 else 0,
+            }
         except Exception as err:  # noqa: BLE001 - never let the tray icon break
             with self.lock:
                 fails = self.cache.get("fails", 0) + 1
-            update = {
+            return {
                 # redact: an exception string could conceivably carry the token.
                 "error": redact(err) or err.__class__.__name__,
                 "fails": fails,
                 "backoff_until": now + backoff_for(fails),
                 "server_backoff_until": 0,
             }
-        with self.lock:
-            self.cache.update(update)
-            self.fetching = False
-            snapshot = dict(self.cache)
-        write_json(CACHE_PATH, snapshot)
-        user32.PostMessageW(self.hwnd, WM_FETCHED, 0, 0)
+        # A convenience for the statusline, and never a reason to call a good
+        # fetch a failure: its own formatting can raise on spend data we did
+        # not expect, and inside the try above that would discard a healthy
+        # 200 and impose a backoff on it.
+        try:
+            write_statusline_sidecar(payload)
+        except Exception:  # noqa: BLE001
+            pass
+        return {
+            "data": payload,
+            "plan": plan,
+            "fetched_at": now,
+            "backoff_until": 0,
+            "server_backoff_until": 0,
+            "error": None,
+            "fails": 0,
+        }
 
     # -- menu -------------------------------------------------------------
 
@@ -1597,7 +1746,7 @@ class Tray:
         spend = (data or {}).get("spend") if isinstance((data or {}).get("spend"), dict) else {}
         used, limit = money(spend.get("used")), money(spend.get("limit"))
         if spend.get("enabled") and used and limit:
-            percent = spend.get("percent")
+            percent = as_percent(spend.get("percent"))
             suffix = f"   {round(percent)}% used" if percent is not None else ""
             user32.AppendMenuW(
                 menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
@@ -1619,10 +1768,10 @@ class Tray:
             suffix = f" ({compact_duration(int(age))} ago)" if age > STALE_AFTER_SECONDS else ""
             stamp = f"Percentages as of {when:%H:%M:%S}{suffix}"
         user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, stamp)
-        plan = sanitize(self.cache.get("plan") or "", limit=24)
+        plan = self.plan()
         if plan:
             user32.AppendMenuW(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, f"Plan: {plan.capitalize()}")
-        detail = status_line(self.cache.get("error"), self.cache.get("backoff_until", 0))
+        detail = status_line(*self.status())
         if detail:
             user32.AppendMenuW(
                 menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0,
