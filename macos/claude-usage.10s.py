@@ -15,7 +15,7 @@
 # The filename sets how often SwiftBar re-renders (10s). That drives the
 # *display* only, so the retry countdown ticks in seconds. The network is
 # touched at most once every 90 seconds and backs off exponentially on
-# failure -- see MIN_FETCH_SECONDS and backoff_for().
+# failure -- see MIN_FETCH_SECONDS and next_attempt_at().
 #
 # Self-invoking actions (driven by the dropdown):
 #   --toggle-credits   flip the credits chip on/off in the menu bar
@@ -101,22 +101,26 @@ STALE_AFTER_SECONDS = 270
 # Dropping the colour is louder, so it waits until the age is beyond
 # explaining away by a missed poll or two.
 UNCOLOURED_AFTER_SECONDS = 900
-# Two ceilings, because two different things are being waited out. The longer
-# one is for a server that told us to go away. Name resolution, routing and
-# timeouts fail on this machine without the request ever leaving it -- nobody
-# asked us to stay away, and capping those the same way is how a laptop that
-# slept through a network change sits all afternoon on figures from before it.
+# The longest we will ever go without asking, and the only ceiling there is.
 #
-# The long ceiling is also the most we will take from a retry-after, because
-# that header is untrustworthy in both directions: observed returning 0 while
-# still refusing, and observed asking for a full hour and then serving the
-# very next request a minute later.
-MAX_BACKOFF_SECONDS = 900
-MAX_LOCAL_BACKOFF_SECONDS = 300
-# Silence longer than this past a poll we owed means nothing was running to
-# make it -- see unattended(). Roughly two missed ticks either side of the
-# poll interval, generous enough that a busy machine running late never trips
-# it and short enough to catch a lid closed over lunch.
+# It is 300 because that is the longest this endpoint has ever actually stayed
+# shut: measured 2026-08-07, twice, a refusal lasts 300s and recovery came at
+# 304. So a wait longer than this can only ever be waiting for something that
+# has already ended. That single fact is what makes the header safe to bound --
+# it has been seen asking for a full hour, and answering 200 to a probe within
+# the minute, three separate times.
+#
+# The other measured fact is what makes bounding it cheap: requests made while
+# refused do not extend the refusal. Asking again costs a refusal we can
+# afford. Not asking costs the entire point of the thing.
+#
+# Everything else in this file -- the doubling, the server's retry-after, our
+# own throttle -- is advice about *when inside this window*, never permission
+# to leave it. See next_attempt_at(), which is the only place that decides.
+MAX_SILENCE_SECONDS = 300
+# Grace on top of MAX_SILENCE_SECONDS before silence is read as "nothing of
+# ours was running". Generous enough that a machine merely running late never
+# trips it. See unattended().
 RESUME_GAP_SECONDS = 120
 
 LOGIN_LABEL = "com.ameba.SwiftBar"
@@ -360,10 +364,10 @@ def force_refresh():
     """
     cache = load_cache()
     cache["last_attempt"] = 0
-    cache["backoff_until"] = 0
-    cache["server_backoff_until"] = 0
     cache["fails"] = 0
+    cache["retry_after"] = 0
     save_cache(cache)
+    log_event({"event": "forced refresh"})
     nudge_swiftbar()
 
 
@@ -385,9 +389,10 @@ def retry_after_seconds(headers):
     RFC 9110 allows either a count of seconds or an HTTP-date, and this
     endpoint has only ever sent the first. Reading a date as "no answer" would
     file a genuine lockout under contention and retry it every ninety seconds,
-    so both forms are read. Neither is trusted further than
-    MAX_BACKOFF_SECONDS: this is the header seen asking for a full hour and
-    then serving the very next request a minute later.
+    so both forms are read. What it says is recorded faithfully and bounded
+    where the decision is made, in next_attempt_at: this is the header seen
+    asking for a full hour and then serving the very next request a minute
+    later.
     """
     value = (headers or {}).get("retry-after")
     if value is None:
@@ -407,79 +412,114 @@ def retry_after_seconds(headers):
     return max(0, int(when.timestamp() - time.time()))
 
 
-def backoff_for(fails, err=None):
-    """Seconds to wait after a failed attempt.
 
-    Doubles per consecutive failure, but the ceiling depends on who failed.
-    `err` present means the server answered, so it gets the long ceiling and
-    its retry-after is honoured -- though only when it asks for *longer*: it
-    has been observed returning `retry-after: 0` while still refusing, and
-    obeying that literally means retrying immediately and forever, which is
-    what keeps the limit tripped.
 
-    Everything else failed on this machine without the request ever leaving
-    it, so those get a ceiling measured in minutes.
+# A rolling record of every attempt, and nothing else. It exists because three
+# separate faults this month were invisible after the fact: the cache holds only
+# the current state, so by the time anyone looks, the evidence of how it got
+# there has been overwritten. One line per attempt is enough to reconstruct all
+# three, and at a poll every 90s it is a few hundred KB a week.
+LOG_PATH = os.path.join(STATE_DIR, "log.jsonl")
+LOG_MAX_BYTES = 256 * 1024
+LOG_KEEP_BYTES = 192 * 1024
+
+
+def rows_summary(data):
+    """{"session": 14, "weekly_all": 6} -- what was on screen at the time."""
+    try:
+        return {str(r["tag"]): round(r["percent"], 1) for r in collect_limits(data or {})}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def log_event(fields):
+    """Append one JSON line. Never raises, never grows without bound.
+
+    Deliberately not a debug switch: the failures worth diagnosing here are
+    rare, days apart, and never reproducible on demand, so a log you have to
+    have turned on in advance is a log you will not have.
     """
-    wait = MIN_FETCH_SECONDS * (2 ** min(fails - 1, 8))
-    if err is None:
-        return min(wait, MAX_LOCAL_BACKOFF_SECONDS)
-    return min(max(wait, retry_after_seconds(getattr(err, "headers", None))),
-               MAX_BACKOFF_SECONDS)
+    try:
+        line = json.dumps({"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                           **fields}, default=str)
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+        except OSError:
+            pass
+        with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            print(redact(line), file=handle)
+            size = handle.tell()
+        if size > LOG_MAX_BYTES:
+            # Keep the tail, and drop whatever partial line the cut lands in.
+            with open(LOG_PATH, "rb") as handle:
+                handle.seek(size - LOG_KEEP_BYTES)
+                kept = handle.read().partition(bytes([10]))[2]
+            write_atomic(LOG_PATH, kept.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - a diagnostic must never be the fault
+        pass
+
+
+def as_time(value, default=0):
+    """A timestamp we can do arithmetic with, or `default`.
+
+    Every reader of the cache goes through this, because "it came off disk" and
+    "it is a finite number" are different claims. NaN is the dangerous one: it
+    compares false against everything, so a NaN deadline is never past.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return value if math.isfinite(value) else default
 
 
 def sane_cache(cache, now):
     """Bring a cache we did not necessarily write into range.
 
-    Every field here is either compared against the clock or added to, so one
-    of the wrong type stops the plugin rather than degrading it -- and the two
-    waits have a ceiling this code could not have exceeded. A backoff further
-    out than MAX_BACKOFF_SECONDS was not written by us: the clock moved, or the
-    file was restored or hand-edited. Capped rather than dropped, because a
-    server wait may genuinely still be owed and fifteen minutes is the longest
-    one we would ever have agreed to. unattended() cannot catch this on its
-    own, since a future backoff reads as a promise still owed -- which is right
-    in every case but this one.
+    Much smaller than it was, because there are no stored deadlines left to
+    police: what used to be `backoff_until` and `server_backoff_until` are now
+    derived by next_attempt_at() on every tick, and a value that is computed
+    cannot be stale. What remains is the evidence those decisions are made
+    from, and it is checked because all of it is either compared against the
+    clock or used in arithmetic.
 
-    Timestamps get a different ceiling: nothing was fetched in the future, and
-    a fetched_at ahead of now makes the figures look permanently fresh.
+    Nothing was fetched or attempted in the future. A fetched_at ahead of now
+    is the nastier of the two: it makes `age` negative, which reads as
+    permanently fresh, so the figures would never be flagged again.
     """
-    for key, ceiling in (("backoff_until", now + MAX_BACKOFF_SECONDS),
-                         ("server_backoff_until", now + MAX_BACKOFF_SECONDS),
-                         ("last_attempt", now),
-                         ("fetched_at", now)):
-        value = cache.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            cache[key] = 0
-        elif value > ceiling:
-            cache[key] = ceiling
+    for key in ("last_attempt", "fetched_at"):
+        cache[key] = min(as_time(cache.get(key)), now)
     fails = cache.get("fails")
     if isinstance(fails, bool) or not isinstance(fails, int) or fails < 0:
         cache["fails"] = 0
+    asked = cache.get("retry_after")
+    if isinstance(asked, bool) or not isinstance(asked, (int, float)) or asked < 0:
+        cache["retry_after"] = 0
+    # Deadlines from the design this replaced. Dropped so a cache written by
+    # this version cannot be misread by a reader still expecting them.
+    for dead in ("backoff_until", "server_backoff_until"):
+        cache.pop(dead, None)
     return cache
 
 
 def unattended(cache, now):
     """True when time has passed that nothing of ours was running for.
 
-    A backoff is a promise to try again at a stated moment. When that moment is
-    well behind us and no attempt was ever made, nothing was there to make it:
-    the machine was off or asleep, or this is the first tick since. So the
-    failures that set the penalty were judging a network from hours ago, and
-    carrying their count across means the first refusal after waking lands on a
-    ceiling it never earned -- fifteen minutes of `--` bought by conditions
-    that no longer exist.
+    MAX_SILENCE_SECONDS is the longest gap this program can leave between
+    attempts, so a longer one cannot have been us waiting -- the machine was
+    off, or suspended, or this is the first run since. The failure count on
+    disk was then earned by a network nobody can see any more, and starting the
+    doubling again is the only honest reading of it.
 
-    This is the only wake detection this build can have. SwiftBar starts a
-    fresh process every tick, so there is no timer of ours to stop ticking and
-    nothing in memory to compare against; the clock is all that carries across.
+    Cheap to state now that there is a ceiling to measure against. It used to
+    need the stored deadline, and a separate timer-gap check beside it to catch
+    a suspend, because a power cycle leaves no gap to see: the process is new
+    and the count comes straight back off disk. The clock covers both.
     """
-    last = cache.get("last_attempt", 0)
+    last = as_time(cache.get("last_attempt"))
     if not last:
         return False
-    # The moment we undertook to try again -- a backoff if one was set, the
-    # ordinary poll otherwise. Silence past it means nobody was listening.
-    due = max(cache.get("backoff_until", 0), last + MIN_FETCH_SECONDS)
-    return now - due > RESUME_GAP_SECONDS
+    return now - (last + MAX_SILENCE_SECONDS) > RESUME_GAP_SECONDS
+
+
 
 
 def rolled_over(row, fetched_at):
@@ -519,6 +559,75 @@ def unreliable(row, fetched_at, age):
     if rolled_over(row, fetched_at):
         return True
     return unanchored(row) and (age is None or age > UNCOLOURED_AFTER_SECONDS)
+
+
+def unusable(cache, now):
+    """True when there is nothing on screen left to protect.
+
+    Once a chip is showing `--` there is no figure a backoff can preserve, so
+    continuing to sit one out buys nothing and costs the only thing this
+    program does. Having no data at all counts the same way.
+    """
+    data = cache.get("data")
+    if not isinstance(data, dict):
+        return True
+    fetched_at = as_time(cache.get("fetched_at"))
+    age = now - fetched_at if fetched_at else None
+    rows = collect_limits(data)
+    if not rows:
+        return True
+    return any(unreliable(row, fetched_at, age) for row in rows)
+
+
+def next_attempt_at(cache, now, forced=False):
+    """The one moment we are allowed to ask again. Computed, never stored.
+
+    Everything about pacing lives here. That is the point: the previous design
+    accumulated penalties in the cache and then patched, one at a time, every
+    path that ought to forgive them -- a failure count surviving a power cycle,
+    a server's wait outliving the figures it was protecting, a wake nobody was
+    running to notice. Each fix was correct and each left the next uncovered
+    case waiting, because a list of exceptions can never be finished.
+
+    So nothing is carried. Each tick asks this function from the state as it
+    stands, and the answer is bounded by construction:
+
+        next_attempt_at(anything, now) - now  <=  MAX_SILENCE_SECONDS
+
+    holds for every possible cache, including ones no code path here can
+    produce -- a clock that jumped, a hand-edited file, a restored backup, a
+    field of the wrong type entirely. That property is what replaces the
+    exceptions, and it is the thing worth testing.
+
+    The floor matters as much as the ceiling: barring a person clicking, the
+    answer is never sooner than MIN_FETCH_SECONDS after the last attempt, which
+    is what keeps us inside a budget shared with Claude Code.
+    """
+    if forced:
+        # Not pacing at all, and the only case that ignores the floor. Someone
+        # clicking Refresh now is overruling exactly this function.
+        return now
+    # Pulled into the window the rest of this reasons about, which is what
+    # makes both bounds hold for any input rather than only for a cache that
+    # has been through sane_cache. An attempt from the future never happened,
+    # and one older than the ceiling is already past due either way, so the two
+    # are indistinguishable from here.
+    last = min(max(as_time(cache.get("last_attempt")), now - MAX_SILENCE_SECONDS), now)
+    if unattended(cache, now) or unusable(cache, now):
+        # Nothing was running to earn those failures, or the figures they were
+        # protecting are already a `--`. Either way waiting improves nothing,
+        # so fall back to the ordinary interval.
+        return last + MIN_FETCH_SECONDS
+    fails = cache.get("fails", 0)
+    if isinstance(fails, bool) or not isinstance(fails, int) or fails <= 0:
+        return last + MIN_FETCH_SECONDS
+    # Doubling, then the server's own ask if it wants longer. It has been seen
+    # returning 0 while still refusing, so it is only ever taken as a floor.
+    wait = MIN_FETCH_SECONDS * (2 ** min(fails - 1, 8))
+    asked = cache.get("retry_after", 0)
+    if isinstance(asked, (int, float)) and not isinstance(asked, bool):
+        wait = max(wait, as_time(asked))
+    return last + min(wait, MAX_SILENCE_SECONDS)
 
 
 def credentials():
@@ -751,20 +860,23 @@ def format_wait(seconds):
     return f"{minutes}m {seconds:02d}s"
 
 
-def status_line(error, backoff_until):
+def status_line(error, retry_at):
     """Recomputed every render, so the wait counts down instead of showing the
     figure that happened to be true when the request failed.
 
     The absolute time leads because SwiftBar does not redraw an already-open
     dropdown: the countdown is a snapshot from the last render and goes stale
     while you read it, whereas the clock time stays correct.
+
+    `retry_at` comes from next_attempt_at, the same expression the poll
+    itself consults, so what this counts down to is when we actually go.
     """
     if not error:
         return None
-    remaining = int(backoff_until - time.time())
+    remaining = int(retry_at - time.time())
     if remaining <= 0:
         return f"{error}, retrying on next refresh"
-    at = datetime.fromtimestamp(backoff_until)
+    at = datetime.fromtimestamp(retry_at)
     return f"{error}, retrying at {at:%H:%M:%S} (in {format_wait(remaining)})"
 
 
@@ -780,7 +892,7 @@ def credit_chip(spend):
     return f"{used}/{limit}"
 
 
-def render(data, plan, config, age=None, error=None, backoff_until=0, fetched_at=0):
+def render(data, plan, config, age=None, error=None, retry_at=0, fetched_at=0):
     rows = collect_limits(data)
     spend = data.get("spend") if isinstance(data.get("spend"), dict) else {}
     show_credits = bool(config.get("show_credits", False))
@@ -882,7 +994,7 @@ def render(data, plan, config, age=None, error=None, backoff_until=0, fetched_at
             f" ({compact_duration(int(age))} ago)" if age > STALE_AFTER_SECONDS else ""
         )
         print(f"Percentages as of {stamp:%H:%M:%S}{suffix} | {DIM}")
-    line = status_line(error, backoff_until)
+    line = status_line(error, retry_at)
     if line:
         print(f"⚠ {sanitize(redact(line), limit=120)} | {DIM}")
     print_footer()
@@ -916,10 +1028,10 @@ def print_controls(config):
     toggle_line("Open at login", login_enabled(), "--toggle-login")
 
 
-def fail(detail, config, backoff_until=0):
+def fail(detail, config, retry_at=0):
     print(f"Claude: ... | {DIM}")
     print("---")
-    detail = status_line(detail, backoff_until) or detail
+    detail = status_line(detail, retry_at) or detail
     print(f"Couldn't read usage: {sanitize(redact(detail), limit=120)} | {MONO}")
     print("---")
     print_controls(config)
@@ -954,31 +1066,15 @@ def main():
     # last_attempt gates the network; fetched_at records when data was last good.
     # Keeping them separate matters: a failed attempt must not make the cached
     # figures look fresh, and must not make them look infinitely stale either.
-    # A figure we can no longer stand behind is the one case where sitting out
-    # a backoff achieves nothing: it counts a window nobody is in, or none we
-    # ever saw, and no amount of waiting improves it. Hold our own penalty --
-    # never the server's -- down to the ordinary poll interval until a fetch
-    # lands.
-    # Woken, booted, or newly installed: the penalty on disk was earned by a
-    # machine that is no longer the one running, so the doubling starts over.
-    # The server's own wait still stands, and has usually expired by itself.
-    if unattended(cache, now) and now >= cache.get("server_backoff_until", 0):
-        cache["fails"] = 0
-        cache["backoff_until"] = 0
-    cached = cache.get("data") if isinstance(cache.get("data"), dict) else {}
-    cached_at = cache.get("fetched_at", 0)
-    cached_age = now - cached_at if cached_at else None
-    if now >= cache.get("server_backoff_until", 0) and any(
-        unreliable(row, cached_at, cached_age) for row in collect_limits(cached)
-    ):
-        cache["backoff_until"] = min(
-            cache.get("backoff_until", 0),
-            cache.get("last_attempt", 0) + MIN_FETCH_SECONDS,
-        )
-    due = now - cache.get("last_attempt", 0) >= MIN_FETCH_SECONDS
-    blocked = now < cache.get("backoff_until", 0)
+    #
+    # One question, asked once, from the state as it stands. There is nothing to
+    # reconcile first -- no penalty on disk to forgive after a wake, no stored
+    # deadline to pull back down once the figures it was protecting have already
+    # become a `--`. Both of those used to be separate passes over the cache
+    # here, and both were places a case could go uncovered.
+    retry_at = next_attempt_at(cache, now)
 
-    if due and not blocked:
+    if now >= retry_at:
         cache["last_attempt"] = now
         # Claim the slot on disk *before* the request, not after it. SwiftBar
         # starts a fresh process every tick and every one of them reads this
@@ -997,10 +1093,9 @@ def main():
                     "data": payload,
                     "plan": plan,
                     "fetched_at": now,
-                    "backoff_until": 0,
-                    "server_backoff_until": 0,
                     "error": None,
                     "fails": 0,
+                    "retry_after": 0,
                 }
             )
             # A convenience for the statusline, and never a reason to call a
@@ -1026,31 +1121,52 @@ def main():
                 # A 429 that names a wait is different, and falls through.
                 fresh = cache.get("fetched_at", 0) >= now - STALE_AFTER_SECONDS
                 cache["error"] = None if fresh else "rate limited"
-                cache["backoff_until"] = now + MIN_FETCH_SECONDS
-                cache["server_backoff_until"] = 0
+                cache["retry_after"] = 0
             else:
-                fails = cache.get("fails", 0) + 1
-                wait = backoff_for(fails, err)
-                cache["fails"] = fails
+                cache["fails"] = cache.get("fails", 0) + 1
                 cache["error"] = (
                     "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
                 )
-                cache["backoff_until"] = now + wait
-                # Only an answer naming a wait is the server asking for room;
-                # anything else is a failure we merely recorded.
-                cache["server_backoff_until"] = now + wait if asked > 0 else 0
+                # What it asked for, not when we will go. The ceiling is
+                # applied where the decision is made, so this stays the honest
+                # record of what was said.
+                cache["retry_after"] = asked
+                # And the header verbatim, so the next argument about it can be
+                # settled by reading the cache rather than reasoning about it:
+                # a long lockout with the count still at one says the server
+                # named a long wait, and nothing recorded whether that arrived
+                # as seconds or as an HTTP-date. Never displayed.
+                cache["last_retry_after"] = sanitize(
+                    str((getattr(err, "headers", None) or {}).get("retry-after")),
+                    limit=64,
+                )
+                cache["last_retry_after_at"] = now
         except Exception as err:  # noqa: BLE001 - never let the menu bar break
-            fails = cache.get("fails", 0) + 1
-            cache["fails"] = fails
+            cache["fails"] = cache.get("fails", 0) + 1
             # redact: an exception string could conceivably carry the token.
             cache["error"] = redact(err) or err.__class__.__name__
-            cache["backoff_until"] = now + backoff_for(fails)
-            cache["server_backoff_until"] = 0
+            # Nobody asked us for anything: the request never reached them.
+            cache["retry_after"] = 0
         save_cache(cache)
+        # The attempt changed the evidence, so the countdown has to be asked
+        # again rather than reused from before it.
+        retry_at = next_attempt_at(cache, now)
+        # One line, here, because every outcome passes through it. `next_in` is
+        # the figure that mattered in all three faults: what the plugin decided
+        # to do next, recorded beside the evidence it decided from.
+        log_event({
+            "event": "fetch",
+            "ok": cache.get("error") is None and cache.get("fetched_at") == now,
+            "error": cache.get("error"),
+            "fails": cache.get("fails"),
+            "asked": cache.get("last_retry_after") if cache.get("retry_after") else None,
+            "next_in": round(retry_at - now),
+            "rows": rows_summary(cache.get("data")),
+        })
 
     data = cache.get("data")
     if not isinstance(data, dict):
-        fail(cache.get("error") or "no data yet", config, cache.get("backoff_until", 0))
+        fail(cache.get("error") or "no data yet", config, retry_at)
         return
 
     fetched_at = cache.get("fetched_at", 0)
@@ -1070,15 +1186,11 @@ def main():
                 config,
                 age,
                 cache.get("error"),
-                cache.get("backoff_until", 0),
+                retry_at,
                 fetched_at,
             )
     except Exception as err:  # noqa: BLE001 - never let the menu bar break
-        fail(
-            redact(err) or err.__class__.__name__,
-            config,
-            cache.get("backoff_until", 0),
-        )
+        fail(redact(err) or err.__class__.__name__, config, retry_at)
     else:
         sys.stdout.write(buffer.getvalue())
 

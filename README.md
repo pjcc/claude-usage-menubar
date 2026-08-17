@@ -82,33 +82,51 @@ fetching are therefore separate:
 - the network is touched **at most once every 90 seconds**, and only when not already
   backing off
 - failures back off **exponentially** from the poll interval: 90s, doubling per
-  consecutive failure. The ceiling depends on who failed. A server that answered gets
-  **fifteen minutes**, which is also the most that will be taken from a `retry-after`,
-  in either of the two forms RFC 9110 allows for it. A failure on this machine - no DNS,
-  no route, a timeout - never reached the server, so nobody asked us to stay away: those
-  cap at **five minutes**. So the ladders are 90, 180, 360, 720, 900 against the server
-  and 90, 180, 300 against ourselves
-- **a wait read back off disk is capped at fifteen minutes**, that being the longest one
-  this code can produce. Anything further out arrived by some other route - a clock that
-  moved, a restored file - and left alone it would stop the polling with nothing on
-  screen able to account for it
+  consecutive failure, and a `retry-after` is honoured when it asks for longer, in
+  either of the two forms RFC 9110 allows for it
+- **but never past five minutes, whatever the reason.** That is the one ceiling, and it
+  is the number it is because five minutes is the longest this endpoint has ever
+  actually stayed shut - measured twice, a refusal lasts 300s. A wait longer than that
+  can only be waiting for something that has already ended. The header has been seen
+  asking for a full hour and then answering a probe normally within the minute, three
+  separate times, so it is treated as advice with a bound rather than an instruction
+- what makes bounding it cheap is the other measured fact: **requests made while refused
+  do not extend the refusal.** Asking again costs a refusal we can afford; not asking
+  costs the entire point of the thing
 - **a hand-driven refresh ignores every one of those**, the server's `retry-after`
   included, and has no floor of its own. All of it paces *polling*, and clicking Refresh
   now is overruling exactly that. The only moment the item is withheld is while a
   request is genuinely open, where it reads `Refreshing...` - a statement of fact, not
   a restriction
-- recovery is **triggered, not just waited out**. Waking from sleep resets the penalty
-  outright, and a usage window that ended while we were offline holds it down to the
-  ordinary poll interval
-- **a penalty never outlives the machine that earned it.** A backoff is an undertaking
-  to try again at a stated moment, so silence well past that moment means nothing was
-  running to make the attempt: the machine was off, asleep, or this is the first run.
-  The failure count is dropped in that case rather than read back off disk, because
-  otherwise the first refusal after a cold boot lands on a ceiling built out of
-  yesterday's network. It is also the only wake detection the macOS build can have -
-  SwiftBar starts a fresh process every tick, so the clock is the only thing that
-  carries across. A wait the *server* asked for is still honoured, it having been
-  addressed to the account rather than to the process
+- **nothing is stored about when to go next.** One function, `next_attempt_at`, is asked
+  on every tick and works it out from the state as it stands: how long since the last
+  attempt, how many failures in a row, what the server asked for, and whether what is on
+  screen is already a `--`. The cache holds that evidence and no decisions, so there is
+  no deadline that can outlive the reason for it
+
+This last point is the design, and it is worth saying why. The obvious way to write
+this - accumulate a penalty, then forgive it in the cases that deserve forgiveness -
+went wrong four times in one day. A failure count survived a power cycle. A wait the
+server asked for outlived the figures it was protecting. Every fix was correct, and
+each one left the next uncovered case waiting, because a list of exceptions can never
+be finished.
+
+So the exceptions were replaced by a property:
+
+```
+next_attempt_at(anything, now) - now  <=  MAX_SILENCE_SECONDS
+```
+
+It holds for every possible cache, including ones no code path can produce - a clock
+that jumped, a hand-edited file, a field of the wrong type entirely - and it is checked
+that way, against a few hundred thousand randomised and deliberately hostile states
+rather than against a list of remembered incidents. **The worst thing that can happen is
+now five minutes of a stale figure, by construction rather than by having thought of
+it.** A wake, a cold boot, a rollover and an hour-long `retry-after` all stop being
+special cases and become the same bound.
+
+- **the same expression drives the countdown you see.** "retrying at 22:37:04" is not a
+  stored moment that might disagree with the code; it is that code, asked again
 - reset countdowns are recomputed **locally** on every render, so they stay accurate
   between polls
 - percentages come from cache, and are flagged once genuinely stale. If a window rolled

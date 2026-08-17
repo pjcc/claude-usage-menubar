@@ -114,21 +114,26 @@ STALE_AFTER_SECONDS = 270
 # icon is glanced at, so it only dims once the age is beyond explaining away
 # by a missed poll or two -- at which point the figure is not a live reading.
 ICON_STALE_AFTER_SECONDS = 900
-# Two ceilings, because two very different things are being waited out. The
-# longer one is for a server that told us to go away. Our own end failing --
-# no DNS, no route, a timeout -- is nobody asking for anything, and capping
-# those the same way is how a machine that briefly lost its network sits five
-# hours stale with the figures from before it slept.
+# The longest we will ever go without asking, and the only ceiling there is.
 #
-# The long ceiling is also the most we will take from a retry-after, because
-# that header is untrustworthy in both directions: observed returning 0 while
-# still refusing, and observed asking for a full hour and then serving the
-# very next request a minute later. Honouring the latter literally is how a
-# widget whose whole job is to be current goes an hour without asking.
-MAX_BACKOFF_SECONDS = 900
-MAX_LOCAL_BACKOFF_SECONDS = 300
-# A 10s timer that has not ticked in two minutes did not run late; the
-# machine was suspended in between.
+# It is 300 because that is the longest this endpoint has ever actually stayed
+# shut: measured 2026-08-07, twice, a refusal lasts 300s and recovery came at
+# 304. So a wait longer than this can only ever be waiting for something that
+# has already ended. That single fact is what makes the header safe to bound --
+# it has been seen asking for a full hour, and answering 200 to a probe within
+# the minute, three separate times.
+#
+# The other measured fact is what makes bounding it cheap: requests made while
+# refused do not extend the refusal. Asking again costs a refusal we can
+# afford. Not asking costs the entire point of the thing.
+#
+# Everything else in this file -- the doubling, the server's retry-after, our
+# own throttle -- is advice about *when inside this window*, never permission
+# to leave it. See next_attempt_at(), which is the only place that decides.
+MAX_SILENCE_SECONDS = 300
+# Grace on top of MAX_SILENCE_SECONDS before silence is read as "nothing of
+# ours was running". Generous enough that a machine merely running late never
+# trips it. See unattended().
 RESUME_GAP_SECONDS = 120
 
 SEVERITY_RANK = {"normal": 0, "warning": 1, "critical": 2, "severe": 2}
@@ -533,9 +538,10 @@ def retry_after_seconds(headers):
     RFC 9110 allows either a count of seconds or an HTTP-date, and this
     endpoint has only ever sent the first. Reading a date as "no answer" would
     file a genuine lockout under contention and retry it every ninety seconds,
-    so both forms are read. Neither is trusted further than
-    MAX_BACKOFF_SECONDS: this is the header seen asking for a full hour and
-    then serving the very next request a minute later.
+    so both forms are read. What it says is recorded faithfully and bounded
+    where the decision is made, in next_attempt_at: this is the header seen
+    asking for a full hour and then serving the very next request a minute
+    later.
     """
     value = (headers or {}).get("retry-after")
     if value is None:
@@ -555,80 +561,110 @@ def retry_after_seconds(headers):
     return max(0, int(when.timestamp() - time.time()))
 
 
-def backoff_for(fails, err=None):
-    """Seconds to wait after a failed attempt.
+# A rolling record of every attempt, and nothing else. It exists because three
+# separate faults this month were invisible after the fact: the cache holds only
+# the current state, so by the time anyone looks, the evidence of how it got
+# there has been overwritten. One line per attempt is enough to reconstruct all
+# three, and at a poll every 90s it is a few hundred KB a week.
+LOG_PATH = os.path.join(STATE_DIR, "log.jsonl")
+LOG_MAX_BYTES = 256 * 1024
+LOG_KEEP_BYTES = 192 * 1024
 
-    Doubles per consecutive failure, but the ceiling depends on who failed.
-    `err` present means the server answered, so it gets the long ceiling and
-    its retry-after is honoured -- though only when it asks for *longer*: the
-    endpoint has been observed returning `retry-after: 0` while still
-    refusing, and obeying that literally means retrying immediately and
-    forever, which keeps the limit tripped.
 
-    Everything else -- name resolution, routing, timeouts -- failed on this
-    machine without the request ever leaving it. Nobody asked us to stay
-    away, so those get a ceiling measured in minutes.
+def rows_summary(data):
+    """{"session": 14, "weekly_all": 6} -- what was on screen at the time."""
+    try:
+        return {str(r["tag"]): round(r["percent"], 1) for r in collect_limits(data or {})}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def log_event(fields):
+    """Append one JSON line. Never raises, never grows without bound.
+
+    Deliberately not a debug switch: the failures worth diagnosing here are
+    rare, days apart, and never reproducible on demand, so a log you have to
+    have turned on in advance is a log you will not have.
     """
-    wait = MIN_FETCH_SECONDS * (2 ** min(fails - 1, 8))
-    if err is None:
-        return min(wait, MAX_LOCAL_BACKOFF_SECONDS)
-    return min(max(wait, retry_after_seconds(getattr(err, "headers", None))),
-               MAX_BACKOFF_SECONDS)
+    try:
+        line = json.dumps({"at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                           **fields}, default=str)
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+        except OSError:
+            pass
+        with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            print(redact(line), file=handle)
+            size = handle.tell()
+        if size > LOG_MAX_BYTES:
+            # Keep the tail, and drop whatever partial line the cut lands in.
+            with open(LOG_PATH, "rb") as handle:
+                handle.seek(size - LOG_KEEP_BYTES)
+                kept = handle.read().partition(bytes([10]))[2]
+            write_atomic(LOG_PATH, kept.decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001 - a diagnostic must never be the fault
+        pass
+
+
+def as_time(value, default=0):
+    """A timestamp we can do arithmetic with, or `default`.
+
+    Every reader of the cache goes through this, because "it came off disk" and
+    "it is a finite number" are different claims. NaN is the dangerous one: it
+    compares false against everything, so a NaN deadline is never past.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    return value if math.isfinite(value) else default
 
 
 def sane_cache(cache, now):
     """Bring a cache we did not necessarily write into range.
 
-    Every field here is either compared against the clock or added to, so one
-    of the wrong type stops the tray rather than degrading it -- and the two
-    waits have a ceiling this code could not have exceeded. A backoff further
-    out than MAX_BACKOFF_SECONDS was not written by us: the clock moved, or the
-    file was restored or hand-edited. Capped rather than dropped, because a
-    server wait may genuinely still be owed and fifteen minutes is the longest
-    one we would ever have agreed to. unattended() cannot catch this on its
-    own, since a future backoff reads as a promise still owed -- which is right
-    in every case but this one.
+    Much smaller than it was, because there are no stored deadlines left to
+    police: what used to be `backoff_until` and `server_backoff_until` are now
+    derived by next_attempt_at() on every tick, and a value that is computed
+    cannot be stale. What remains is the evidence those decisions are made
+    from, and it is checked because all of it is either compared against the
+    clock or used in arithmetic.
 
-    Timestamps get a different ceiling: nothing was fetched in the future, and
-    a fetched_at ahead of now makes the figures look permanently fresh.
+    Nothing was fetched or attempted in the future. A fetched_at ahead of now
+    is the nastier of the two: it makes `age` negative, which reads as
+    permanently fresh, so the figures would never be flagged again.
     """
-    for key, ceiling in (("backoff_until", now + MAX_BACKOFF_SECONDS),
-                         ("server_backoff_until", now + MAX_BACKOFF_SECONDS),
-                         ("last_attempt", now),
-                         ("fetched_at", now)):
-        value = cache.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            cache[key] = 0
-        elif value > ceiling:
-            cache[key] = ceiling
+    for key in ("last_attempt", "fetched_at"):
+        cache[key] = min(as_time(cache.get(key)), now)
     fails = cache.get("fails")
     if isinstance(fails, bool) or not isinstance(fails, int) or fails < 0:
         cache["fails"] = 0
+    asked = cache.get("retry_after")
+    if isinstance(asked, bool) or not isinstance(asked, (int, float)) or asked < 0:
+        cache["retry_after"] = 0
+    # Deadlines from the design this replaced. Dropped so a cache written by
+    # this version cannot be misread by a reader still expecting them.
+    for dead in ("backoff_until", "server_backoff_until"):
+        cache.pop(dead, None)
     return cache
 
 
 def unattended(cache, now):
     """True when time has passed that nothing of ours was running for.
 
-    A backoff is a promise to try again at a stated moment. When that moment is
-    well behind us and no attempt was ever made, nothing was there to make it:
-    the machine was off, or suspended, or this is the first run since. So the
-    failures that set the penalty were judging a network from hours ago, and
-    carrying their count across means the first refusal after a cold start
-    lands on a ceiling it never earned -- fifteen minutes of `--` bought by
-    conditions that no longer exist.
+    MAX_SILENCE_SECONDS is the longest gap this program can leave between
+    attempts, so a longer one cannot have been us waiting -- the machine was
+    off, or suspended, or this is the first run since. The failure count on
+    disk was then earned by a network nobody can see any more, and starting the
+    doubling again is the only honest reading of it.
 
-    check_resume() reads a suspend off a timer that stopped ticking, but a
-    power cycle leaves no gap to see: the process is new and the count comes
-    back off disk. Reading it from the clock instead covers both.
+    Cheap to state now that there is a ceiling to measure against. It used to
+    need the stored deadline, and a separate timer-gap check beside it to catch
+    a suspend, because a power cycle leaves no gap to see: the process is new
+    and the count comes straight back off disk. The clock covers both.
     """
-    last = cache.get("last_attempt", 0)
+    last = as_time(cache.get("last_attempt"))
     if not last:
         return False
-    # The moment we undertook to try again -- a backoff if one was set, the
-    # ordinary poll otherwise. Silence past it means nobody was listening.
-    due = max(cache.get("backoff_until", 0), last + MIN_FETCH_SECONDS)
-    return now - due > RESUME_GAP_SECONDS
+    return now - (last + MAX_SILENCE_SECONDS) > RESUME_GAP_SECONDS
 
 
 def rolled_over(row, fetched_at):
@@ -668,6 +704,75 @@ def unreliable(row, fetched_at, age):
     if rolled_over(row, fetched_at):
         return True
     return unanchored(row) and (age is None or age > ICON_STALE_AFTER_SECONDS)
+
+
+def unusable(cache, now):
+    """True when there is nothing on screen left to protect.
+
+    Once a row is showing `--` there is no figure a backoff can preserve, so
+    continuing to sit one out buys nothing and costs the only thing this
+    program does. Having no data at all counts the same way.
+    """
+    data = cache.get("data")
+    if not isinstance(data, dict):
+        return True
+    fetched_at = as_time(cache.get("fetched_at"))
+    age = now - fetched_at if fetched_at else None
+    rows = collect_limits(data)
+    if not rows:
+        return True
+    return any(unreliable(row, fetched_at, age) for row in rows)
+
+
+def next_attempt_at(cache, now, forced=False):
+    """The one moment we are allowed to ask again. Computed, never stored.
+
+    Everything about pacing lives here. That is the point: the previous design
+    accumulated penalties in the cache and then patched, one at a time, every
+    path that ought to forgive them -- a failure count surviving a power cycle,
+    a server's wait outliving the figures it was protecting, a wake nobody was
+    running to notice. Each fix was correct and each left the next uncovered
+    case waiting, because a list of exceptions can never be finished.
+
+    So nothing is carried. Each tick asks this function from the state as it
+    stands, and the answer is bounded by construction:
+
+        next_attempt_at(anything, now) - now  <=  MAX_SILENCE_SECONDS
+
+    holds for every possible cache, including ones no code path here can
+    produce -- a clock that jumped, a hand-edited file, a restored backup, a
+    field of the wrong type entirely. That property is what replaces the
+    exceptions, and it is the thing worth testing.
+
+    The floor matters as much as the ceiling: barring a person clicking, the
+    answer is never sooner than MIN_FETCH_SECONDS after the last attempt, which
+    is what keeps us inside a budget shared with Claude Code.
+    """
+    if forced:
+        # Not pacing at all, and the only case that ignores the floor. Someone
+        # clicking Refresh now is overruling exactly this function.
+        return now
+    # Pulled into the window the rest of this reasons about, which is what
+    # makes both bounds hold for any input rather than only for a cache that
+    # has been through sane_cache. An attempt from the future never happened,
+    # and one older than the ceiling is already past due either way, so the two
+    # are indistinguishable from here.
+    last = min(max(as_time(cache.get("last_attempt")), now - MAX_SILENCE_SECONDS), now)
+    if unattended(cache, now) or unusable(cache, now):
+        # Nothing was running to earn those failures, or the figures they were
+        # protecting are already a `--`. Either way waiting improves nothing,
+        # so fall back to the ordinary interval.
+        return last + MIN_FETCH_SECONDS
+    fails = cache.get("fails", 0)
+    if isinstance(fails, bool) or not isinstance(fails, int) or fails <= 0:
+        return last + MIN_FETCH_SECONDS
+    # Doubling, then the server's own ask if it wants longer. It has been seen
+    # returning 0 while still refusing, so it is only ever taken as a floor.
+    wait = MIN_FETCH_SECONDS * (2 ** min(fails - 1, 8))
+    asked = cache.get("retry_after", 0)
+    if isinstance(asked, (int, float)) and not isinstance(asked, bool):
+        wait = max(wait, as_time(asked))
+    return last + min(wait, MAX_SILENCE_SECONDS)
 
 
 def credentials():
@@ -907,15 +1012,17 @@ def format_wait(seconds):
     return f"{minutes}m {seconds:02d}s"
 
 
-def status_line(error, backoff_until):
+def status_line(error, retry_at):
     """Recomputed on every render, so the wait counts down instead of showing
-    the figure that happened to be true when the request failed."""
+    the figure that happened to be true when the request failed. `retry_at`
+    comes from next_attempt_at, the same expression the poll itself consults,
+    so what this counts down to is the moment we actually go."""
     if not error:
         return None
-    remaining = int(backoff_until - time.time())
+    remaining = int(retry_at - time.time())
     if remaining <= 0:
         return f"{error}, retrying shortly"
-    at = datetime.fromtimestamp(backoff_until)
+    at = datetime.fromtimestamp(retry_at)
     return f"{error}, retrying at {at:%H:%M:%S} (in {format_wait(remaining)})"
 
 
@@ -1315,13 +1422,12 @@ class Tray:
         self.config = read_json(CONFIG_PATH)
         self.lock = threading.Lock()
         self.fetching = False
-        self.last_tick = time.time()
-        self.cache = sane_cache(read_json(CACHE_PATH), self.last_tick)
-        # A cold start is a resume nobody was running to notice, and the cache
-        # hands back the failure count from before it. Same reasoning as
-        # check_resume(), applied to the one case it cannot see.
-        if unattended(self.cache, self.last_tick):
-            self.clear_local_backoff(hard=True)
+        # No startup reconciliation to do: a cold start is just another tick
+        # whose cache happens to be old, and next_attempt_at reads that off the
+        # clock like any other. What used to be handled here, and separately
+        # again on every timer tick, is now one expression consulted at the
+        # moment the question is asked.
+        self.cache = sane_cache(read_json(CACHE_PATH), time.time())
         self.icon = None
         self.hwnd = None
         self.size = max(user32.GetSystemMetrics(49), 16)  # SM_CXSMICON
@@ -1512,59 +1618,24 @@ class Tray:
         return time.time() - fetched_at if fetched_at else None
 
     def status(self):
-        """The error and the wait it belongs to, read together.
-
-        fetch_now applies its result as one dict.update, which is not atomic
-        across keys: read separately, a menu drawn at the wrong instant can
-        pair a new error with the old wait and show a countdown that never
-        was. Cheap to take them under the same lock as everything else."""
+        """The error and the moment we next ask, read together under one lock
+        so a menu drawn while a fetch lands cannot pair one with the other."""
         with self.lock:
-            return self.cache.get("error"), self.cache.get("backoff_until", 0)
+            return self.cache.get("error"), next_attempt_at(self.cache, time.time())
 
     def plan(self):
         with self.lock:
             return sanitize(self.cache.get("plan") or "", limit=24)
 
-    def clear_local_backoff(self, hard):
-        """Drop the penalty we imposed on ourselves, never the one the server
-        asked for. `hard` wipes the failure count too, for the cases where the
-        conditions that caused those failures are known to have changed."""
+    def due_at(self):
+        """When the next attempt is allowed, and what the menu counts down to.
+
+        The same expression drives both, so the countdown on screen and the
+        moment we actually ask can no longer disagree -- they were two stored
+        values before, and a menu drawn while a fetch landed could pair one
+        with the other."""
         with self.lock:
-            if time.time() < self.cache.get("server_backoff_until", 0):
-                return
-            if hard:
-                self.cache["fails"] = 0
-                self.cache["backoff_until"] = 0
-            else:
-                self.cache["backoff_until"] = min(
-                    self.cache.get("backoff_until", 0),
-                    self.cache.get("last_attempt", 0) + MIN_FETCH_SECONDS,
-                )
-
-    def check_resume(self):
-        """A 10s timer that has not ticked in two minutes did not run late --
-        the machine was suspended. Waking is the one moment the figures are
-        guaranteed to have moved on without us, and whatever failed before the
-        suspend was judging a network that no longer exists, so the doubling
-        starts again from scratch rather than carrying an hour of penalty
-        across a sleep that may have lasted all afternoon.
-        """
-        now = time.time()
-        gap = now - self.last_tick
-        self.last_tick = now
-        if gap > RESUME_GAP_SECONDS:
-            self.clear_local_backoff(hard=True)
-
-    def check_rollover(self):
-        """A figure we can no longer stand behind is the one case where sitting
-        out a backoff achieves nothing: it counts a window nobody is in, or
-        none we ever saw, and no amount of waiting improves it. Hold our own
-        penalty down to the ordinary poll interval until a fetch lands."""
-        fetched_at = self.fetched_at()
-        age = self.age()
-        rows = collect_limits(self.data() or {})
-        if any(unreliable(row, fetched_at, age) for row in rows):
-            self.clear_local_backoff(hard=False)
+            return next_attempt_at(self.cache, time.time())
 
     def maybe_fetch(self, force=False):
         """Starts a fetch if one is due.
@@ -1580,31 +1651,25 @@ class Tray:
             # without racing it for the cache.
             if self.fetching:
                 return "A refresh is already running."
-            # Everything below paces our *polling*. Someone clicking Refresh
-            # now is overruling exactly that, so none of it applies to them.
-            # There is no floor on top: a popup menu cannot auto-repeat, the
-            # sustained load is the once-a-minute poll rather than a person
-            # clicking, and rate-limiting the control whose whole purpose is
-            # to override a rate limit is how this went wrong twice already.
+            if now < next_attempt_at(self.cache, now, forced=force):
+                # Only reachable unforced -- next_attempt_at returns `now` for
+                # a person clicking, which is the whole point of that branch.
+                return (
+                    "Backing off after a failure."
+                    if self.cache.get("fails", 0)
+                    else "Polled recently."
+                )
+            self.fetching = True
+            self.cache["last_attempt"] = now
             if force:
-                self.fetching = True
-                self.cache["last_attempt"] = now
                 # A person clicking is not a poll, and the failures of one are
                 # not the other's to inherit. Without this, five failed clicks
-                # during an outage walk the count to the ceiling and leave the
-                # *automatic* poll sitting out a quarter of an hour it never
-                # earned -- the control that exists to escape a wait, buying
-                # you a longer one. The Mac build's force_refresh() has always
-                # cleared the count for the same reason.
+                # during an outage walk the count up and leave the *automatic*
+                # poll sitting out a wait it never earned -- the control that
+                # exists to escape a wait, buying you a longer one.
                 self.cache["fails"] = 0
-            else:
-                if now - self.cache.get("last_attempt", 0) < MIN_FETCH_SECONDS:
-                    return "Polled recently."
-                if now < self.cache.get("backoff_until", 0):
-                    return "Backing off after a failure."
-                self.fetching = True
-                self.cache["last_attempt"] = now
-        threading.Thread(target=self.fetch_now, daemon=True).start()
+                self.cache["retry_after"] = 0
+        threading.Thread(target=self.fetch_now, args=(force,), daemon=True).start()
         return None
 
     def refresh_in_flight(self):
@@ -1617,7 +1682,7 @@ class Tray:
         with self.lock:
             return self.fetching
 
-    def fetch_now(self):
+    def fetch_now(self, forced=False):
         """Run one attempt on the worker thread and record what it did.
 
         `fetching` is cleared here and nowhere else, so the recording is a
@@ -1634,7 +1699,7 @@ class Tray:
         except Exception as err:  # noqa: BLE001 - a handler itself failed
             update = {
                 "error": redact(err) or err.__class__.__name__,
-                "backoff_until": now + MIN_FETCH_SECONDS,
+                "retry_after": 0,
             }
         finally:
             with self.lock:
@@ -1642,10 +1707,31 @@ class Tray:
                 self.fetching = False
                 snapshot = dict(self.cache)
             write_json(CACHE_PATH, snapshot)
+            # One line, here, because this is the only place every outcome
+            # passes through. `next_in` is the figure that mattered in all
+            # three faults: it is what the tray decided to do next, recorded
+            # beside the evidence it decided from.
+            log_event({
+                "event": "fetch",
+                "forced": forced,
+                "ok": "data" in update,
+                "error": snapshot.get("error"),
+                "fails": snapshot.get("fails"),
+                "asked": snapshot.get("last_retry_after") if update.get("retry_after")
+                else None,
+                "next_in": round(next_attempt_at(snapshot, time.time()) - time.time()),
+                "rows": rows_summary(snapshot.get("data")),
+            })
             user32.PostMessageW(self.hwnd, WM_FETCHED, 0, 0)
 
     def attempt(self, now):
-        """One request, reduced to the cache fields it changes."""
+        """One request, reduced to the cache fields it changes.
+
+        What it records is evidence, never a decision: how many failures in a
+        row, and how long the server said it wanted. When to ask next is read
+        off that by next_attempt_at() at the moment the question is asked,
+        which is what stops a wait outliving the reason for it.
+        """
         try:
             access_token, plan = credentials()
             payload = fetch(access_token)
@@ -1666,21 +1752,28 @@ class Tray:
                     stale = self.cache.get("fetched_at", 0) < now - STALE_AFTER_SECONDS
                 return {
                     "error": "rate limited" if stale else None,
-                    "backoff_until": now + MIN_FETCH_SECONDS,
-                    "server_backoff_until": 0,
+                    "retry_after": 0,
                 }
             with self.lock:
                 fails = self.cache.get("fails", 0) + 1
-            wait = backoff_for(fails, err)
             return {
                 "fails": fails,
                 "error": (
                     "rate limited" if err.code == 429 else f"HTTP {err.code} from endpoint"
                 ),
-                "backoff_until": now + wait,
-                # Only an answer naming a wait is the server asking for room;
-                # anything else is a failure we merely recorded.
-                "server_backoff_until": now + wait if asked > 0 else 0,
+                # What it asked for, not when we will go. The ceiling is
+                # applied where the decision is made, so this stays the honest
+                # record of what was said.
+                "retry_after": asked,
+                # And the header verbatim, so the next argument about it can be
+                # settled by reading the cache rather than reasoning about it:
+                # a long lockout with the count still at one says the server
+                # named a long wait, and nothing recorded whether that arrived
+                # as seconds or as an HTTP-date. Never displayed.
+                "last_retry_after": sanitize(
+                    str((getattr(err, "headers", None) or {}).get("retry-after")), limit=64
+                ),
+                "last_retry_after_at": now,
             }
         except Exception as err:  # noqa: BLE001 - never let the tray icon break
             with self.lock:
@@ -1689,8 +1782,8 @@ class Tray:
                 # redact: an exception string could conceivably carry the token.
                 "error": redact(err) or err.__class__.__name__,
                 "fails": fails,
-                "backoff_until": now + backoff_for(fails),
-                "server_backoff_until": 0,
+                # Nobody asked us for anything: the request never reached them.
+                "retry_after": 0,
             }
         # A convenience for the statusline, and never a reason to call a good
         # fetch a failure: its own formatting can raise on spend data we did
@@ -1704,10 +1797,9 @@ class Tray:
             "data": payload,
             "plan": plan,
             "fetched_at": now,
-            "backoff_until": 0,
-            "server_backoff_until": 0,
             "error": None,
             "fails": 0,
+            "retry_after": 0,
         }
 
     # -- menu -------------------------------------------------------------
@@ -1815,6 +1907,7 @@ class Tray:
         if ident == ID_REFRESH:
             refused = self.maybe_fetch(force=True)
             if refused:
+                log_event({"event": "refresh refused", "why": refused})
                 self.balloon(refused, warning=True)
         elif ident == ID_SETTINGS:
             os.startfile(SETTINGS_URL)
@@ -1878,11 +1971,10 @@ class Tray:
                 os.startfile(SETTINGS_URL)
         elif message == WM_TIMER:
             # Display only: the countdowns are recomputed locally on every
-            # tick, while maybe_fetch enforces the once-a-minute network floor.
-            # The two checks ahead of it can lift a backoff we set ourselves,
-            # so they run first or their finding waits a whole tick.
-            self.check_resume()
-            self.check_rollover()
+            # tick, while maybe_fetch enforces the network floor. There is
+            # nothing to reconcile ahead of it any more -- the sleep check and
+            # the rollover check both existed to lift a stored penalty, and
+            # there is no longer one to lift.
             self.maybe_fetch()
             self.refresh_display()
         elif message == WM_FETCHED:
@@ -1920,6 +2012,20 @@ class Tray:
         # launcher begins in the overflow however deliberately it was pinned.
         if self.option("pinned", False) and not pinned() and set_pinned(True):
             self.readd()
+        # What we inherited. The cold-boot fault was invisible precisely
+        # because nothing recorded the count the cache handed back.
+        now = time.time()
+        with self.lock:
+            log_event({
+                "event": "start",
+                "fails": self.cache.get("fails"),
+                "last_attempt_age": round(now - self.cache["last_attempt"])
+                if self.cache.get("last_attempt") else None,
+                "fetched_age": round(now - self.cache["fetched_at"])
+                if self.cache.get("fetched_at") else None,
+                "unattended": unattended(self.cache, now),
+                "next_in": round(next_attempt_at(self.cache, now) - now),
+            })
         # 10s, matching the Mac build's filename-driven cadence: it costs no
         # network and lets the retry countdown tick in seconds.
         user32.SetTimer(self.hwnd, 1, 10000, None)

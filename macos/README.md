@@ -86,7 +86,8 @@ floor of its own.
 | Path | |
 |---|---|
 | `~/.config/swiftbar-claude-usage/config.json` | Settings |
-| `~/.config/swiftbar-claude-usage/cache.json` | Cached usage, backoff state |
+| ` ~/.config/swiftbar-claude-usage/cache.json` | Cached usage, and the evidence pacing is worked out from |
+| `~/.config/swiftbar-claude-usage/log.jsonl` | One line per attempt, capped at 256KB. `tail -20` it when something looks stuck: `next_in` is what the plugin decided to do next, `asked` is the `Retry-After` header verbatim |
 | `~/.config/swiftbar-claude-usage/statusline` | One-line sidecar for a Claude Code statusline that wants the credit figure without a network call |
 
 All `0600`. Deleting any of them is safe, as they are rebuilt on the next poll. They
