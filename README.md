@@ -150,6 +150,12 @@ special cases and become the same bound.
   refresh and a scheduled poll can be in flight at once
 - no shell is ever invoked; `subprocess` is always given an argument list
 
+What none of that changes: on macOS the token comes from the login keychain, but on
+Windows Claude Code keeps it in plaintext at `%USERPROFILE%\.claude\.credentials.json`,
+readable by anything running as you. That is Claude Code's storage decision, not this
+plugin's, and the hardening above is about not widening the exposure - it cannot narrow
+it.
+
 Limits are read generically from the API's `limits` array, so a cap this code has
 never heard of appears as an extra row with no change.
 
