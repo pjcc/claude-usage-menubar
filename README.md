@@ -179,10 +179,11 @@ it has to be made twice.** The two builds are kept honest by name: the same func
 take the same arguments in the same order, so a missing edit shows up as a diff of
 function bodies rather than having to be reasoned about.
 
-`write_statusline_sidecar` is the one item on that list with a reader outside this
-repo. Both builds emit the same six-field line, documented in each platform README, and
-a Claude Code statusline parses it. **Its field order and units are a contract**, so
-changing them has to be made three times, not twice.
+`write_statusline_sidecar` is the one item on that list whose output something outside
+this repo parses. Both builds emit the same six-field line, documented in each platform
+README, and that line is a published format rather than an internal detail - **changing
+it has to be made twice here and then coordinated with whatever reads it**, which is a
+different and worse problem than the rest of the list.
 
 The exception, and the one that has actually bitten, is behaviour that exists under
 different names on the two sides - Windows forcing a refresh through `maybe_fetch`,

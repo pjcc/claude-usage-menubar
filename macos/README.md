@@ -127,17 +127,19 @@ Two things a reader has to handle:
 - **Absence is meaningful.** The file is removed, not zeroed, when the account has no
   extra-usage credits, so a missing file means the feature is off and the correct
   rendering is nothing at all. It is likewise simply absent on a machine that has never
-  run this, which is what makes the chip safe to add unconditionally
+  run this, so a reader can look for it unconditionally and degrade to showing nothing
 - **It only moves while the plugin is running.** Nothing else refreshes it, so check
-  `epoch` before trusting the figure rather than assuming it is current. For reference,
-  this build marks its own reading "(figures stale)" at `STALE_AFTER_SECONDS`, 270s;
-  the dotfiles statusline is laxer and flags the sidecar at 900s
+  `epoch` before trusting the figure rather than assuming it is current. Roughly fifteen
+  minutes is a sane bar for a reader; for comparison this build marks its own reading
+  "(figures stale)" at `STALE_AFTER_SECONDS`, 270s
 
 The Windows build writes the identical line, at
-`%LOCALAPPDATA%\claude-usage-tray\statusline`. The statusline in
-[pjcc/dotfiles](https://github.com/pjcc/dotfiles) reads both paths in turn, so one
-script covers either machine. **Changing the field order or units breaks it silently** -
-it validates each field but cannot tell a reordered line from a plausible one.
+`%LOCALAPPDATA%\claude-usage-tray\statusline`, so a reader that tries both paths in turn
+covers either machine with one script.
+
+**Treat the field order and units as fixed.** A reader can validate each field and still
+not tell a reordered line from a plausible one, so a change here breaks it silently
+rather than loudly.
 
 ## Refresh rate
 
