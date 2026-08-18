@@ -179,10 +179,63 @@ Also worth knowing:
 | `%LOCALAPPDATA%\claude-usage-tray\config.json` | Settings |
 | `%LOCALAPPDATA%\claude-usage-tray\cache.json` | Cached usage, and the evidence pacing is worked out from |
 | `%LOCALAPPDATA%\claude-usage-tray\log.jsonl` | One line per attempt, capped at 256KB. See below |
-| `%LOCALAPPDATA%\claude-usage-tray\statusline` | One-line sidecar for a Claude Code statusline that wants the credit figure without a network call |
+| `%LOCALAPPDATA%\claude-usage-tray\statusline` | One-line sidecar for a Claude Code statusline that wants the credit figure without a network call. Format below |
 | `%LOCALAPPDATA%\claude-usage-tray\ClaudeUsage.exe`, `pyvenv.cfg` | The rebranded interpreter it runs under, see above |
 
-Deleting any of them is safe; they are rebuilt on the next poll or the next start.
+Deleting any of them is safe; they are rebuilt on the next poll or the next start. The
+one exception is `statusline`, rebuilt only while the account has extra-usage credits,
+because its absence is meaningful - see below.
+
+## The statusline sidecar
+
+It exists so a Claude Code statusline can show the credit figure **without calling the
+endpoint itself**. A statusline re-renders on every message, and the endpoint
+rate-limits hard enough that a second caller would starve this one. So the traffic
+stays here and the number goes out through a file: this writes, anything else reads,
+and nothing reads back.
+
+One space-separated line, rewritten on every successful poll:
+
+```
+2529 4000 GBP 2 63 1787066531
+```
+
+| Field | |
+|---|---|
+| `used_minor` | Credit spent, in minor units - `2529` is £25.29 |
+| `limit_minor` | The extra-usage cap, same units |
+| `currency` | ISO code, or `?` if the response carried none |
+| `exponent` | Minor units per major unit as a power of ten: `2` for GBP/USD/EUR, `0` for JPY |
+| `percent` | Percent of the cap used, as the API reports it - **not** recomputed from the two amounts, so do not assume they agree |
+| `epoch` | Unix seconds at which the line was written |
+
+The figures come straight off the `spend` block of the usage response. That makes them
+money already drawn down, account-wide, and in the account's own currency - not a
+per-session estimate and not converted.
+
+Two things a reader has to handle:
+
+- **Absence is meaningful.** The file is removed, not zeroed, when the account has no
+  extra-usage credits, so a missing file means the feature is off and the correct
+  rendering is nothing at all. It is likewise simply absent on a machine that has never
+  run this, which is what makes the chip safe to add unconditionally
+- **It only moves while the tray app is running.** Nothing else refreshes it, so check
+  `epoch` before trusting the figure rather than assuming it is current. For reference,
+  this build marks its own reading "(figures stale)" at `STALE_AFTER_SECONDS`, 270s,
+  and stops trusting the icon digits at `ICON_STALE_AFTER_SECONDS`, 900s; the dotfiles
+  statusline flags the sidecar at the latter
+
+The macOS build writes the identical line, at
+`~/.config/swiftbar-claude-usage/statusline`. The statusline in
+[pjcc/dotfiles](https://github.com/pjcc/dotfiles) reads both paths in turn, so one
+script covers either machine. **Changing the field order or units breaks it silently** -
+it validates each field but cannot tell a reordered line from a plausible one.
+
+One trap worth naming for anyone reading this path from a shell script: the literal
+`${VAR//\\//}` does **not** turn backslashes into forward slashes. It parses as
+"delete every forward slash", and on a Windows path that is a harmless no-op, so it
+looks correct right up until it mangles a POSIX one. The pattern has to be quoted:
+`${var//"$bs"//}`.
 
 ## The log
 
