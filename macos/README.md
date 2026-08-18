@@ -65,7 +65,7 @@ open /Applications/SwiftBar.app
 
 The first time it polls, macOS asks whether SwiftBar may read the
 `Claude Code-credentials` keychain item. Choose **Always Allow**, since plain *Allow*
-will re-prompt every minute.
+will re-prompt on every poll.
 
 If the menu bar item never appears, this prompt is the usual reason. It can hide behind
 other windows.
@@ -98,7 +98,7 @@ plugin and would try to execute them.
 
 SwiftBar takes the re-render interval from the filename, so to change it rename the
 file, for example `claude-usage.30s.py`. Only the display rate changes; the
-once-a-minute network floor is enforced in code, not by the filename.
+90-second network floor is enforced in code, not by the filename.
 
 ## Uninstall
 
