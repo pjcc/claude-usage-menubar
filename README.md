@@ -172,11 +172,18 @@ every file in its plugin directory as a plugin and would try to execute it.
 
 **What is duplicated is not only formatting.** It includes the whole rate-limit policy -
 `retry_after_seconds`, `sane_cache`, `unattended`, `rolled_over`, `unanchored`,
-`unreliable`, `unusable`, `next_attempt_at`, `collect_limits`, and the block that decides
+`unreliable`, `unusable`, `next_attempt_at`, `collect_limits`, `write_statusline_sidecar`,
+and the block that decides
 contention from a genuine lockout - which is precisely the part that keeps changing. **A change to any of
 it has to be made twice.** The two builds are kept honest by name: the same functions
 take the same arguments in the same order, so a missing edit shows up as a diff of
 function bodies rather than having to be reasoned about.
+
+`write_statusline_sidecar` is the one item on that list whose output something outside
+this repo parses. Both builds emit the same six-field line, documented in each platform
+README, and that line is a published format rather than an internal detail - **changing
+it has to be made twice here and then coordinated with whatever reads it**, which is a
+different and worse problem than the rest of the list.
 
 The exception, and the one that has actually bitten, is behaviour that exists under
 different names on the two sides - Windows forcing a refresh through `maybe_fetch`,

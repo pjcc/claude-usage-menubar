@@ -88,11 +88,58 @@ floor of its own.
 | `~/.config/swiftbar-claude-usage/config.json` | Settings |
 | ` ~/.config/swiftbar-claude-usage/cache.json` | Cached usage, and the evidence pacing is worked out from |
 | `~/.config/swiftbar-claude-usage/log.jsonl` | One line per attempt, capped at 256KB. `tail -20` it when something looks stuck: `next_in` is what the plugin decided to do next, `asked` is the `Retry-After` header verbatim |
-| `~/.config/swiftbar-claude-usage/statusline` | One-line sidecar for a Claude Code statusline that wants the credit figure without a network call |
+| `~/.config/swiftbar-claude-usage/statusline` | One-line sidecar for a Claude Code statusline that wants the credit figure without a network call. Format below |
 
-All `0600`. Deleting any of them is safe, as they are rebuilt on the next poll. They
-live outside the plugin folder on purpose: SwiftBar treats every file in there as a
-plugin and would try to execute them.
+All `0600`. Deleting any of them is safe, as they are rebuilt on the next poll - with
+one exception: `statusline` is rebuilt only while the account has extra-usage credits,
+because its absence is meaningful (see below). They live outside the plugin folder on
+purpose: SwiftBar treats every file in there as a plugin and would try to execute them.
+
+## The statusline sidecar
+
+It exists so a Claude Code statusline can show the credit figure **without calling the
+endpoint itself**. A statusline re-renders on every message, and the endpoint
+rate-limits hard enough that a second caller would starve this one. So the traffic
+stays here and the number goes out through a file: this writes, anything else reads,
+and nothing reads back.
+
+One space-separated line, rewritten on every successful poll:
+
+```
+2529 4000 GBP 2 63 1787066531
+```
+
+| Field | |
+|---|---|
+| `used_minor` | Credit spent, in minor units - `2529` is £25.29 |
+| `limit_minor` | The extra-usage cap, same units |
+| `currency` | ISO code, or `?` if the response carried none |
+| `exponent` | Minor units per major unit as a power of ten: `2` for GBP/USD/EUR, `0` for JPY |
+| `percent` | Percent of the cap used, as the API reports it - **not** recomputed from the two amounts, so do not assume they agree |
+| `epoch` | Unix seconds at which the line was written |
+
+The figures come straight off the `spend` block of the usage response. That makes them
+money already drawn down, account-wide, and in the account's own currency - not a
+per-session estimate and not converted.
+
+Two things a reader has to handle:
+
+- **Absence is meaningful.** The file is removed, not zeroed, when the account has no
+  extra-usage credits, so a missing file means the feature is off and the correct
+  rendering is nothing at all. It is likewise simply absent on a machine that has never
+  run this, so a reader can look for it unconditionally and degrade to showing nothing
+- **It only moves while the plugin is running.** Nothing else refreshes it, so check
+  `epoch` before trusting the figure rather than assuming it is current. Roughly fifteen
+  minutes is a sane bar for a reader; for comparison this build marks its own reading
+  "(figures stale)" at `STALE_AFTER_SECONDS`, 270s
+
+The Windows build writes the identical line, at
+`%LOCALAPPDATA%\claude-usage-tray\statusline`, so a reader that tries both paths in turn
+covers either machine with one script.
+
+**Treat the field order and units as fixed.** A reader can validate each field and still
+not tell a reordered line from a plausible one, so a change here breaks it silently
+rather than loudly.
 
 ## Refresh rate
 
