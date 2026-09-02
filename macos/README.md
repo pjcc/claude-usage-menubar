@@ -54,12 +54,19 @@ ditto SwiftBar.app /Applications/SwiftBar.app
 ### 2. The plugin
 
 ```sh
-mkdir -p ~/.swiftbar
-cp claude-usage.10s.py ~/.swiftbar/
-chmod +x ~/.swiftbar/claude-usage.10s.py
-defaults write com.ameba.SwiftBar PluginDirectory -string "$HOME/.swiftbar"
+mkdir -p ~/SwiftBarPlugins
+cp claude-usage.10s.py ~/SwiftBarPlugins/
+chmod +x ~/SwiftBarPlugins/claude-usage.10s.py
+defaults write com.ameba.SwiftBar PluginDirectory -string "$HOME/SwiftBarPlugins"
 open /Applications/SwiftBar.app
 ```
+
+**The plugin folder has to be visible, not a dotfolder.** SwiftBar 2.1.0 (594) on macOS
+26.6.2 lists a hidden folder such as `~/.swiftbar` and finds the file in it, confirms it
+exists and is executable, then cannot read its type or size and skips it as "not a regular
+file". Nothing runs and the menu bar shows SwiftBar's own fallback item instead. A 29-byte
+`echo` script in the same folder is rejected identically, and Foundation reads both files
+fine from any other process, so this is the folder rather than the plugin or the file.
 
 ### 3. Approve the keychain prompt
 
@@ -69,6 +76,12 @@ will re-prompt on every poll.
 
 If the menu bar item never appears, this prompt is the usual reason. It can hide behind
 other windows.
+
+The other reason is that the plugin was never loaded at all, which looks the same from the
+menu bar. SwiftBar writes
+`~/Library/Application Support/SwiftBar/Diagnostics/latest-system-report.txt` whenever it
+finds nothing loadable. Its `Plugin Directory Candidates` section names every file it
+considered and why each was rejected, and `Loaded Plugins: 0` confirms none ever ran.
 
 ## Dropdown options
 
@@ -150,7 +163,7 @@ file, for example `claude-usage.30s.py`. Only the display rate changes; the
 ## Uninstall
 
 ```sh
-rm ~/.swiftbar/claude-usage.10s.py
+rm ~/SwiftBarPlugins/claude-usage.10s.py
 rm -rf ~/.config/swiftbar-claude-usage
 rm -f ~/Library/LaunchAgents/com.ameba.SwiftBar.plist
 ```
