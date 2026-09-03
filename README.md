@@ -125,6 +125,52 @@ now five minutes of a stale figure, by construction rather than by having though
 it.** A wake, a cold boot, a rollover and an hour-long `retry-after` all stop being
 special cases and become the same bound.
 
+#### The one refusal that waiting cannot fix
+
+A 401 is different in kind from all of the above. The bound is about *when* to ask
+again, and it is right that nothing can push an answer more than five minutes away. But
+a 401 does not say "ask later". It says this token is not acceptable, and the token is a
+file on this machine, so asking again with the same file changes nothing.
+
+That is not academic. The token Claude Code stores lives about eight hours and is only
+rewritten when Claude Code runs, so a machine left to itself overnight expires it. On
+2026-09-03 the tray then spent nine hours going round this loop:
+
+- three 401s in a row, roughly four minutes apart
+- at which point the endpoint stops answering 401 and starts answering **429 with
+  `Retry-After: 3600`**
+- the ceiling above correctly refuses to sit out an hour, so it polls through the whole
+  hour at 90s
+- the hour ends, the token is still expired, and it starts again
+
+Around 340 requests, every one of them certain to fail, against a budget shared with
+Claude Code itself. The display stayed honest throughout - `--` for the session, the
+weekly figure held uncoloured, the reason in the menu - but the reason it gave was
+"rate limited", which was true and useless. The thing to do was open Claude Code.
+
+So there is a second gate, and it turns on the credential rather than the clock:
+
+- a 401 records a **fingerprint** of the token that was refused - a truncated SHA-256,
+  never the token itself - as evidence in the cache, and no failure count, because
+  doubling is guesswork about a server that might recover and there is nothing here to
+  guess at
+- while the token on disk is still that token there is nothing worth sending, so nothing
+  is sent. This is not a longer wait; it is a different question, asked before the wait,
+  which is why `next_attempt_at` is untouched and its bound still holds word for word
+- **recovery is not polled for.** It *is* the file changing, and the fingerprint of the
+  file is read every tick for nothing - so a token Claude Code has just rewritten goes
+  out on the next ordinary poll, within 90 seconds rather than up to an hour
+- a probe every 15 minutes backstops the case where the refusal was the server's mistake
+  rather than the token's, and a lockout met while the credential is already suspect
+  paces the next probe the same way, being the same refusal
+- a hand-driven refresh ignores the gate, as it ignores everything else
+- the menu says `token rejected, open Claude Code to refresh it`, because unlike every
+  other failure here there is something to be done about it, and it is not ours to do
+
+The same nine hours, replayed against the same endpoint behaviour: **36 requests instead
+of 359**, and the recovery arrives 90 seconds after the token is rewritten instead of
+whenever the next hour-long lockout happens to lapse.
+
 - **the same expression drives the countdown you see.** "retrying at 22:37:04" is not a
   stored moment that might disagree with the code; it is that code, asked again
 - reset countdowns are recomputed **locally** on every render, so they stay accurate
