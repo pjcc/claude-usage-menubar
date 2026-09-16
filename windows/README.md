@@ -250,8 +250,10 @@ once it passes 256KB.
 `next_in` is the field that matters: it is what the tray decided to do next, recorded
 beside the evidence it decided from. `sent: false` is the other one to look for: a tick
 that decided the token on disk was one the endpoint has already refused and said
-nothing at all. A run of those with `error: "token rejected, ..."` is the tray waiting
-for you to open Claude Code, not a fault. `asked` is the `Retry-After` header verbatim,
+nothing at all. A run of those with `error: "token expired, ..."` is the tray waiting
+for you to run Claude Code in a terminal, not a fault - and `"token rejected, ..."` in
+that position means the token was refused while the file still called it valid, which is
+worth a closer look. `asked` is the `Retry-After` header verbatim,
 which is the thing that was missing when a fifteen-minute lockout appeared with the
 failure count still at one and there was no way to tell what the server had actually
 sent. A `start` line records what the cache handed back on launch, which is where a

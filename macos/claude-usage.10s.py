@@ -131,10 +131,22 @@ RESUME_GAP_SECONDS = 120
 # hour rather than forty, and caps a server-side false 401 at a quarter hour of
 # `--`. A judgement, and a cheap one whichever way it is wrong.
 AUTH_PROBE_SECONDS = 900
-# What the menu says while the credential is the thing in the way. It names the
-# fix, because unlike every other failure in this file there is one and it is
-# the user's: nothing this program can do turns a 401 into a 200.
-AUTH_ERROR = "token rejected, open Claude Code to refresh it"
+# What the menu says while the credential is the thing in the way. Both name
+# the fix, because unlike every other failure in this file there is one and it
+# is the user's: nothing this program can do turns a 401 into a 200.
+#
+# Two of them, because the blob answers the question a 401 leaves open. A token
+# past its `expiresAt` is the ordinary overnight case and says so; a token
+# refused while the file still calls it valid is something else -- revoked,
+# rescoped, or the endpoint at fault -- and reads as the anomaly it is.
+#
+# Both say *in a terminal*, which the one string they replaced did not. On
+# 2026-09-16 the Windows build sat on `--` for 40 hours saying "open Claude
+# Code to refresh it" while Claude Code was open all day -- in the browser,
+# which has its own session and never touches this credential. Only the CLI
+# writes it.
+AUTH_ERROR = "token rejected, run Claude Code in a terminal to refresh it"
+EXPIRED_ERROR = "token expired, run Claude Code in a terminal to refresh it"
 
 LOGIN_LABEL = "com.ameba.SwiftBar"
 LOGIN_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LOGIN_LABEL}.plist")
@@ -573,7 +585,30 @@ def token_refused_before(cache, fingerprint):
     return bool(fingerprint) and isinstance(recorded, str) and recorded == fingerprint
 
 
-def rejected_token(cache, fingerprint, now):
+def token_expired(expires_at, now):
+    """True when the credential on disk says of itself that it has lapsed.
+
+    `expiresAt` is Claude Code's own stamp, in epoch milliseconds, sitting in
+    the blob beside the token it describes. It was read past for a year: the
+    only question ever asked of the credential was what a 401 said about it,
+    and the file had the answer the whole time.
+
+    Read fresh every tick with the token, and cached nowhere. A stored copy
+    would be a decision about a file that is opened anyway, which is the shape
+    this design exists to avoid -- and a decision that outlives its evidence
+    by exactly as long as the file goes unread.
+
+    Fails towards asking, like every gate here. A missing field, a string, a
+    bool, a NaN, a negative, a nonsense zero: every one lands on False, and
+    False sends the request. Wrong that way costs one call. Wrong the other
+    way is a tray that never asks again, which is the only failure in this
+    file that cannot recover on its own.
+    """
+    stamp = as_time(expires_at) / 1000.0
+    return stamp > 0 and now > stamp
+
+
+def rejected_token(cache, fingerprint, now, expires_at):
     """True when the credential on disk is one the endpoint has already refused.
 
     The single failure here that waiting cannot fix. A 429 clears on its own
@@ -593,6 +628,13 @@ def rejected_token(cache, fingerprint, now):
     is read every tick for nothing. The interval only backstops the refusal
     having been the server's mistake rather than the token's.
 
+    The expiry is read second, and only ever after a refusal already stands
+    against this exact credential. That order is what makes it safe to trust a
+    clock: a machine set wrong can say "expired" about a perfectly good token
+    all day and still gate nothing, because the server has to have refused it
+    first. The file alone never closes this; it only explains a refusal that
+    has already happened, which is the one thing it is qualified to do.
+
     Fails towards asking, deliberately, and the elapsed time is bounded at
     both ends for the same reason next_attempt_at() bounds its own: a refusal
     dated in the future is the one input that could hold the gate shut for
@@ -603,6 +645,15 @@ def rejected_token(cache, fingerprint, now):
     """
     if not token_refused_before(cache, fingerprint):
         return False
+    if token_expired(expires_at, now):
+        # The refusal is accounted for, and by the same file the recovery will
+        # arrive in. The interval below exists for a refusal the server got
+        # wrong; a lapsed expiry is not that, so a probe cannot learn anything
+        # the blob has not already said and there is nothing left to time.
+        # This is the whole of the saving: without it the 15 minutes go on
+        # spending a request each, for 40 hours, to be told what the file said
+        # at the start.
+        return True
     since = as_time(cache.get("auth_failed_at"))
     return since > 0 and 0 <= now - since < AUTH_PROBE_SECONDS
 
@@ -716,8 +767,14 @@ def next_attempt_at(cache, now, forced=False):
 
 
 def credentials():
-    """Returns (access_token, plan). Claude Code refreshes the token in place,
-    so this is read fresh on every poll rather than cached."""
+    """Returns (access_token, plan, expires_at). Claude Code refreshes the
+    token in place, so this is read fresh on every poll rather than cached.
+
+    `expires_at` is handed on exactly as found, milliseconds and all: what it
+    means is token_expired()'s business, and that function is shared with the
+    Windows build where this one is not. Nothing here validates it, because a
+    reader that sanitises loses the difference between "absent" and "absurd",
+    and the gate wants both to land in the same place anyway."""
     out = subprocess.run(
         ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
         capture_output=True,
@@ -727,7 +784,11 @@ def credentials():
     if out.returncode != 0:
         raise RuntimeError("no keychain entry (is Claude Code signed in?)")
     oauth = json.loads(out.stdout)["claudeAiOauth"]
-    return oauth["accessToken"], oauth.get("subscriptionType") or ""
+    return (
+        oauth["accessToken"],
+        oauth.get("subscriptionType") or "",
+        oauth.get("expiresAt"),
+    )
 
 
 class RefuseRedirect(urllib.request.HTTPRedirectHandler):
@@ -1172,19 +1233,20 @@ def main():
         save_cache(cache)
         # Bound before the try, because the handlers below read them and the
         # keychain is the one step that can fail before they are set.
-        fingerprint, suspect, sent = "", False, True
+        fingerprint, suspect, sent, expired = "", False, True, False
         try:
-            access_token, plan = credentials()
+            access_token, plan, expires_at = credentials()
             fingerprint = token_fingerprint(access_token)
+            expired = token_expired(expires_at, now)
             suspect = token_refused_before(cache, fingerprint)
-            sent = not rejected_token(cache, fingerprint, now)
+            sent = not rejected_token(cache, fingerprint, now, expires_at)
             if not sent:
                 # There is nothing here that could be answered, so nothing is
                 # sent. Not a wait either: the next tick asks the same question
                 # of a file that may have changed by then, and a click on
                 # Refresh now drops the evidence outright -- see
                 # force_refresh(), which is where this build's "forced" lives.
-                cache["error"] = AUTH_ERROR
+                cache["error"] = EXPIRED_ERROR if expired else AUTH_ERROR
                 cache["retry_after"] = 0
             else:
                 payload = fetch(access_token)
@@ -1237,7 +1299,7 @@ def main():
                 # is the same refusal, so it paces the next probe like one.
                 # Contention (the branch above) is not read this way: an
                 # endpoint too busy to answer says nothing about who is asking.
-                cache["error"] = AUTH_ERROR
+                cache["error"] = EXPIRED_ERROR if expired else AUTH_ERROR
                 cache["auth_failed_for"] = fingerprint
                 cache["auth_failed_at"] = now
                 cache["retry_after"] = asked
@@ -1256,7 +1318,7 @@ def main():
                 # 401 alone: 403 has never been seen from this endpoint, and
                 # "your scopes are wrong" is not the same claim as "this token
                 # is stale", so it keeps the ordinary treatment until it is.
-                cache["error"] = AUTH_ERROR
+                cache["error"] = EXPIRED_ERROR if expired else AUTH_ERROR
                 cache["auth_failed_for"] = fingerprint
                 cache["auth_failed_at"] = now
                 cache["retry_after"] = 0
