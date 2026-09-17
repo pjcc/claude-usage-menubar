@@ -25,6 +25,7 @@
 
 import contextlib
 import email.utils
+import hashlib
 import io
 import json
 import math
@@ -122,6 +123,18 @@ MAX_SILENCE_SECONDS = 300
 # ours was running". Generous enough that a machine merely running late never
 # trips it. See unattended().
 RESUME_GAP_SECONDS = 120
+# How long a refused credential is taken at its word before we test it again.
+# Not measured, unlike the numbers above it: 401 is unambiguous, and the
+# recovery that actually matters -- Claude Code rewriting the token -- is seen
+# locally on the next tick without asking anyone. This only backstops the case
+# where the endpoint was wrong to refuse us. 900s makes that four requests an
+# hour rather than forty, and caps a server-side false 401 at a quarter hour of
+# `--`. A judgement, and a cheap one whichever way it is wrong.
+AUTH_PROBE_SECONDS = 900
+# What the menu says while the credential is the thing in the way. It names the
+# fix, because unlike every other failure in this file there is one and it is
+# the user's: nothing this program can do turns a 401 into a 200.
+AUTH_ERROR = "token rejected, open Claude Code to refresh it"
 
 LOGIN_LABEL = "com.ameba.SwiftBar"
 LOGIN_PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LOGIN_LABEL}.plist")
@@ -366,6 +379,14 @@ def force_refresh():
     cache["last_attempt"] = 0
     cache["fails"] = 0
     cache["retry_after"] = 0
+    # And the credential gate, which is the same claim about a different
+    # thing: rejected_token() may be holding a request back because a 401
+    # stands against the token on disk, and the person clicking has quite
+    # possibly just signed in. Windows passes `forced` down into the request
+    # itself; there is nothing to pass here, so the evidence goes and the next
+    # tick asks for real. This is the pair with no counterpart to diff.
+    cache["auth_failed_for"] = None
+    cache["auth_failed_at"] = 0
     save_cache(cache)
     log_event({"event": "forced refresh"})
     nudge_swiftbar()
@@ -485,7 +506,7 @@ def sane_cache(cache, now):
     is the nastier of the two: it makes `age` negative, which reads as
     permanently fresh, so the figures would never be flagged again.
     """
-    for key in ("last_attempt", "fetched_at"):
+    for key in ("last_attempt", "fetched_at", "auth_failed_at"):
         cache[key] = min(as_time(cache.get(key)), now)
     fails = cache.get("fails")
     if isinstance(fails, bool) or not isinstance(fails, int) or fails < 0:
@@ -493,6 +514,11 @@ def sane_cache(cache, now):
     asked = cache.get("retry_after")
     if isinstance(asked, bool) or not isinstance(asked, (int, float)) or asked < 0:
         cache["retry_after"] = 0
+    # Which token was refused, if one was. A non-string would compare unequal
+    # to every fingerprint anyway, so this buys nothing but keeping the single
+    # question rejected_token() asks a question about two strings.
+    if not isinstance(cache.get("auth_failed_for"), str):
+        cache["auth_failed_for"] = None
     # Deadlines from the design this replaced. Dropped so a cache written by
     # this version cannot be misread by a reader still expecting them.
     for dead in ("backoff_until", "server_backoff_until"):
@@ -520,6 +546,65 @@ def unattended(cache, now):
     return now - (last + MAX_SILENCE_SECONDS) > RESUME_GAP_SECONDS
 
 
+
+def token_fingerprint(token):
+    """A stable name for a token that is not the token.
+
+    This gets cached and logged, so it has to survive being read by anyone who
+    can read those -- which the token must not, hence a digest rather than a
+    prefix of it. Truncated because the only question ever asked of it is
+    whether the credential on disk is still the one that was refused, and
+    sixteen hex characters settle that.
+    """
+    if not isinstance(token, str) or not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def token_refused_before(cache, fingerprint):
+    """True when a 401 stands recorded against exactly this credential.
+
+    Separate from rejected_token() because the two are asked at different
+    moments and the interval is only half the question. Once the probe falls
+    due the gate opens, but the credential is no more trusted than it was a
+    second earlier, and what comes back has to be read in that light.
+    """
+    recorded = cache.get("auth_failed_for")
+    return bool(fingerprint) and isinstance(recorded, str) and recorded == fingerprint
+
+
+def rejected_token(cache, fingerprint, now):
+    """True when the credential on disk is one the endpoint has already refused.
+
+    The single failure here that waiting cannot fix. A 429 clears on its own
+    and a dropped connection is worth retrying, but a 401 says this token is
+    not acceptable, and the token is a file on this machine: it goes on not
+    being acceptable until Claude Code rewrites it. Polling through that is
+    worse than wasted -- three refusals in a row and the endpoint starts
+    answering with an hour-long 429, which is how a token that expired
+    overnight turned into nine hours of `--` on 2026-09-03, some 340 requests
+    spent against a budget shared with Claude Code to learn the same thing 340
+    times.
+
+    So the gate is the credential rather than the clock, which is why this
+    leaves next_attempt_at() alone and its bound still holds word for word.
+    Nor is this the ceiling in disguise: recovery is not something that has to
+    be polled for, it *is* the file changing, and the fingerprint of the file
+    is read every tick for nothing. The interval only backstops the refusal
+    having been the server's mistake rather than the token's.
+
+    Fails towards asking, deliberately, and the elapsed time is bounded at
+    both ends for the same reason next_attempt_at() bounds its own: a refusal
+    dated in the future is the one input that could hold the gate shut for
+    good, and a jumped clock or a hand-edited file produces one without any
+    code here having gone wrong. An unrecognisable fingerprint, a missing or
+    nonsensical timestamp, a cache written by another version -- every one of
+    them lands on False, and False sends the request.
+    """
+    if not token_refused_before(cache, fingerprint):
+        return False
+    since = as_time(cache.get("auth_failed_at"))
+    return since > 0 and 0 <= now - since < AUTH_PROBE_SECONDS
 
 
 def rolled_over(row, fetched_at):
@@ -1085,27 +1170,49 @@ def main():
         # ten seconds -- so a slow endpoint drew *more* traffic from us rather
         # than less, which is the opposite of what the whole throttle is for.
         save_cache(cache)
+        # Bound before the try, because the handlers below read them and the
+        # keychain is the one step that can fail before they are set.
+        fingerprint, suspect, sent = "", False, True
         try:
             access_token, plan = credentials()
-            payload = fetch(access_token)
-            cache.update(
-                {
-                    "data": payload,
-                    "plan": plan,
-                    "fetched_at": now,
-                    "error": None,
-                    "fails": 0,
-                    "retry_after": 0,
-                }
-            )
-            # A convenience for the statusline, and never a reason to call a
-            # good fetch a failure: its own formatting can raise on spend data
-            # we did not expect, and that would otherwise land in the handler
-            # below -- discarding a healthy 200 and imposing a backoff on it.
-            try:
-                write_statusline_sidecar(payload)
-            except Exception:  # noqa: BLE001
-                pass
+            fingerprint = token_fingerprint(access_token)
+            suspect = token_refused_before(cache, fingerprint)
+            sent = not rejected_token(cache, fingerprint, now)
+            if not sent:
+                # There is nothing here that could be answered, so nothing is
+                # sent. Not a wait either: the next tick asks the same question
+                # of a file that may have changed by then, and a click on
+                # Refresh now drops the evidence outright -- see
+                # force_refresh(), which is where this build's "forced" lives.
+                cache["error"] = AUTH_ERROR
+                cache["retry_after"] = 0
+            else:
+                payload = fetch(access_token)
+                cache.update(
+                    {
+                        "data": payload,
+                        "plan": plan,
+                        "fetched_at": now,
+                        "error": None,
+                        "fails": 0,
+                        "retry_after": 0,
+                        # A 200 settles it: whatever was refused, this was not.
+                        # The fingerprint must not outlive the refusal it
+                        # recorded, or the next expiry is gated on a comparison
+                        # against a dead token.
+                        "auth_failed_for": None,
+                        "auth_failed_at": 0,
+                    }
+                )
+                # A convenience for the statusline, and never a reason to call
+                # a good fetch a failure: its own formatting can raise on spend
+                # data we did not expect, and that would otherwise land in the
+                # handler below -- discarding a healthy 200 and imposing a
+                # backoff on it.
+                try:
+                    write_statusline_sidecar(payload)
+                except Exception:  # noqa: BLE001
+                    pass
         except urllib.error.HTTPError as err:
             asked = retry_after_seconds(getattr(err, "headers", None))
             if err.code == 429 and asked <= 0:
@@ -1121,6 +1228,37 @@ def main():
                 # A 429 that names a wait is different, and falls through.
                 fresh = cache.get("fetched_at", 0) >= now - STALE_AFTER_SECONDS
                 cache["error"] = None if fresh else "rate limited"
+                cache["retry_after"] = 0
+            elif suspect and asked > 0:
+                # A lockout met while this credential is already suspect is,
+                # on the evidence, the one our own 401s earned: three in a row
+                # and this endpoint starts naming an hour. Polling through it
+                # at the ordinary rate is how the saving gets given back -- it
+                # is the same refusal, so it paces the next probe like one.
+                # Contention (the branch above) is not read this way: an
+                # endpoint too busy to answer says nothing about who is asking.
+                cache["error"] = AUTH_ERROR
+                cache["auth_failed_for"] = fingerprint
+                cache["auth_failed_at"] = now
+                cache["retry_after"] = asked
+                cache["last_retry_after"] = sanitize(
+                    str((getattr(err, "headers", None) or {}).get("retry-after")),
+                    limit=64,
+                )
+                cache["last_retry_after_at"] = now
+            elif err.code == 401:
+                # Evidence, not a count. `fails` feeds the doubling, and the
+                # doubling is guesswork about a server that may yet recover;
+                # there is nothing to guess at here, since we know what is
+                # wrong and what will change it. Recording which token was
+                # refused lets rejected_token() gate on that instead, exactly.
+                #
+                # 401 alone: 403 has never been seen from this endpoint, and
+                # "your scopes are wrong" is not the same claim as "this token
+                # is stale", so it keeps the ordinary treatment until it is.
+                cache["error"] = AUTH_ERROR
+                cache["auth_failed_for"] = fingerprint
+                cache["auth_failed_at"] = now
                 cache["retry_after"] = 0
             else:
                 cache["fails"] = cache.get("fails", 0) + 1
@@ -1156,6 +1294,9 @@ def main():
         # to do next, recorded beside the evidence it decided from.
         log_event({
             "event": "fetch",
+            # False is the interesting line: a tick that decided the credential
+            # on disk was already refused and said nothing.
+            "sent": sent,
             "ok": cache.get("error") is None and cache.get("fetched_at") == now,
             "error": cache.get("error"),
             "fails": cache.get("fails"),

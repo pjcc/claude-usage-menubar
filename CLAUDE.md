@@ -50,7 +50,8 @@ should differ only in docstring wording:
 
 ```sh
 extract () { awk -v fn="^def $2" '$0 ~ fn {p=1; print; next} p && /^(def |class |[A-Z_]+ =)/ {exit} p' "$1"; }
-for f in retry_after_seconds sane_cache unattended rolled_over unanchored unreliable unusable next_attempt_at collect_limits; do
+for f in retry_after_seconds sane_cache unattended token_fingerprint token_refused_before \
+         rejected_token rolled_over unanchored unreliable unusable next_attempt_at collect_limits; do
   echo "== $f"; diff <(extract macos/claude-usage.10s.py $f) <(extract windows/claude-usage-tray.pyw $f)
 done
 ```
@@ -65,13 +66,17 @@ platform-specific; everything between `retry_after_seconds` and `collect_limits`
 **The two builds deliberately share no code and duplicate that middle layer verbatim.** Each is
 meant to be self-contained, and on macOS a shared module could not sit beside the plugin -
 SwiftBar executes every file in its plugin directory. The duplicated set is
-`retry_after_seconds`, `sane_cache`, `unattended`, `rolled_over`, `unanchored`, `unreliable`,
-`unusable`, `next_attempt_at`, `collect_limits`, and the 429 branch in the fetch path. Same
-names, same arguments, same order, so a missing edit shows as a body diff.
+`retry_after_seconds`, `sane_cache`, `unattended`, `token_fingerprint`,
+`token_refused_before`, `rejected_token`, `rolled_over`, `unanchored`, `unreliable`,
+`unusable`, `next_attempt_at`, `collect_limits`, and the 429/401 branches in the fetch
+path. Same names, same arguments, same order, so a missing edit shows as a body diff.
 **A change to any of it has to be made twice.** The exception that has actually bitten is
 behaviour with different names on each side - Windows forces a refresh through
 `Tray.maybe_fetch`, macOS through `force_refresh` - which has no counterpart to diff and needs
-checking by hand.
+checking by hand. The credential gate below is the live example: Windows passes `forced`
+into `Tray.attempt` and the gate reads it, while macOS has nothing to pass, so
+`force_refresh` has to clear `auth_failed_for`/`auth_failed_at` out of the cache instead.
+Two different mechanisms for one rule, and the diff sees neither.
 
 The two builds differ where the hosts do. SwiftBar re-executes the whole script every tick (the
 `10s` in the filename), so the macOS build holds no process state at all: every tick reloads the
@@ -103,6 +108,17 @@ that:
   lockout and increments `fails` (doubling from 90s, capped by the 300s ceiling)
 - `last_attempt` (gates the network) and `fetched_at` (when data was last good) are separate and
   must stay so: a failed attempt must not make cached figures look fresh, nor infinitely stale
+- **A 401 is the one refusal the bound cannot help with, and gets a second gate.** Waiting
+  does not make a token acceptable; only Claude Code rewriting the file does. Left to the
+  ceiling alone this cost nine hours and ~340 certain-to-fail requests on 2026-09-03: three
+  401s make the endpoint answer 429 `Retry-After: 3600`, the ceiling rightly polls through
+  the hour, the hour ends, the token is still expired. So `rejected_token` gates on *which*
+  credential was refused (`token_fingerprint`, a truncated SHA-256, never the token) rather
+  than on the clock. It is deliberately not an exception to `next_attempt_at` - it is asked
+  before it, leaving the invariant intact - and recovery needs no poll at all, since it is
+  the file changing and the file is read every tick anyway. A 15-minute probe backstops a
+  401 the server was wrong to send; a 429 arriving while the credential is already suspect
+  paces the next probe rather than being polled through, or most of the saving goes back
 
 ### Never show a figure that cannot be stood behind
 
