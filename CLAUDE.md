@@ -51,7 +51,8 @@ should differ only in docstring wording:
 ```sh
 extract () { awk -v fn="^def $2" '$0 ~ fn {p=1; print; next} p && /^(def |class |[A-Z_]+ =)/ {exit} p' "$1"; }
 for f in retry_after_seconds sane_cache unattended token_fingerprint token_refused_before \
-         rejected_token rolled_over unanchored unreliable unusable next_attempt_at collect_limits; do
+         token_expired rejected_token rolled_over unanchored unreliable unusable \
+         next_attempt_at collect_limits; do
   echo "== $f"; diff <(extract macos/claude-usage.10s.py $f) <(extract windows/claude-usage-tray.pyw $f)
 done
 ```
@@ -67,9 +68,9 @@ platform-specific; everything between `retry_after_seconds` and `collect_limits`
 meant to be self-contained, and on macOS a shared module could not sit beside the plugin -
 SwiftBar executes every file in its plugin directory. The duplicated set is
 `retry_after_seconds`, `sane_cache`, `unattended`, `token_fingerprint`,
-`token_refused_before`, `rejected_token`, `rolled_over`, `unanchored`, `unreliable`,
-`unusable`, `next_attempt_at`, `collect_limits`, and the 429/401 branches in the fetch
-path. Same names, same arguments, same order, so a missing edit shows as a body diff.
+`token_refused_before`, `token_expired`, `rejected_token`, `rolled_over`, `unanchored`,
+`unreliable`, `unusable`, `next_attempt_at`, `collect_limits`, and the 429/401 branches
+in the fetch path. Same names, same arguments, same order, so a missing edit shows as a body diff.
 **A change to any of it has to be made twice.** The exception that has actually bitten is
 behaviour with different names on each side - Windows forces a refresh through
 `Tray.maybe_fetch`, macOS through `force_refresh` - which has no counterpart to diff and needs
@@ -119,6 +120,18 @@ that:
   the file changing and the file is read every tick anyway. A 15-minute probe backstops a
   401 the server was wrong to send; a 429 arriving while the credential is already suspect
   paces the next probe rather than being polled through, or most of the saving goes back
+- **`expiresAt` says whether the 401 is explained, and is read second on purpose.**
+  `token_expired` is asked only after a refusal already stands against that exact
+  fingerprint, so a wrong clock can never close the gate by itself - the file explains a
+  refusal, it never causes one. When it does explain one the 15-minute probe stops, since
+  that probe exists for a refusal the server got wrong and a lapsed expiry is not that.
+  Nothing is cached: the expiry is read from the blob with the token it describes, every
+  tick. Every malformed value reads as "not expired" and sends the request. The two
+  situations get two strings, `EXPIRED_ERROR` and `AUTH_ERROR`, and both say *in a
+  terminal* - on 2026-09-16 the single older message sent the user looking at a browser
+  tab for 40 hours, because only the CLI writes this file. Note the forced path needed no
+  new code on either build: the rule keys off the recorded 401, so Windows passing
+  `forced` and macOS clearing the evidence both already release it
 
 ### Never show a figure that cannot be stood behind
 

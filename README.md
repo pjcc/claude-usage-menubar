@@ -164,12 +164,63 @@ So there is a second gate, and it turns on the credential rather than the clock:
   rather than the token's, and a lockout met while the credential is already suspect
   paces the next probe the same way, being the same refusal
 - a hand-driven refresh ignores the gate, as it ignores everything else
-- the menu says `token rejected, open Claude Code to refresh it`, because unlike every
-  other failure here there is something to be done about it, and it is not ours to do
+- the menu names the fix, because unlike every other failure here there is something to
+  be done about it, and it is not ours to do
 
 The same nine hours, replayed against the same endpoint behaviour: **36 requests instead
 of 359**, and the recovery arrives 90 seconds after the token is rewritten instead of
 whenever the next hour-long lockout happens to lapse.
+
+#### The blob had the answer all along
+
+The gate above turns on *whether* this credential was refused. It never asked *why*, and
+the credential says: Claude Code writes an `expiresAt` beside the token, and neither
+build read it. So a 401 got one message covering two different situations, and the
+15-minute probe went on spending a request at a time to rediscover something already
+written on disk.
+
+On **2026-09-16** that cost 40 hours of `--`. The token lapsed overnight on the 14th;
+the gate held correctly and the probe kept its promise, 61 requests over the outage
+instead of thousands. But the menu said `token rejected, open Claude Code to refresh it`
+while Claude Code was open all day - in the browser, which has its own session and never
+touches this file. **Only the CLI writes it**, and the message did not say so. The
+figures came back within 90 seconds of the next `claude` session rewriting the token,
+which is the gate working exactly as designed, and it still read as a stuck tray.
+
+So the expiry is read too, as evidence and never as an instruction:
+
+- **it is asked second, and only after a refusal already stands against that exact
+  token.** That order is the whole safety argument: a machine with a clock set wrong can
+  call a perfectly good token expired all day and still gate nothing, because the server
+  has to have refused it first. The file cannot close this gate on its own - it can only
+  explain a refusal that has already happened, which is the one thing it is qualified to
+  do
+- when a refusal *is* explained that way, the 15-minute probe stops. It exists for a
+  refusal the server got wrong, and a lapsed expiry is not that, so there is nothing
+  left to learn by asking. Recovery is unaffected: it was never the probe that noticed,
+  it is the file changing, and the file is read every tick regardless
+- the two situations get two messages. `token expired, run Claude Code in a terminal to
+  refresh it` is the ordinary overnight case. `token rejected, run Claude Code in a
+  terminal to refresh it` is a token refused while the file still calls it valid -
+  revoked, rescoped, or the endpoint at fault - and reads as the anomaly it is
+- neither carries a "retrying at" countdown. A tick past a refused token re-reads the
+  file and sends nothing, so a countdown to it promised a retry that never went out,
+  restarting every 90 seconds for as long as the token stayed dead. Running the CLI is
+  noticed on the next tick without a click
+- nothing is cached. The expiry is read from the blob with the token it describes, on
+  every tick, exactly like the fingerprint. A stored copy would be a decision outliving
+  its evidence, which is the pattern the whole design exists to avoid
+- a missing field, a string, a bool, a NaN, a negative, a nonsense zero: every one of
+  them reads as "not expired", and that sends the request. Wrong that way costs one
+  call. Wrong the other way is a tray that never asks again
+
+Replayed against the real 40 hours: **3 requests instead of 61** - one to find out, and
+one for each time Refresh now was clicked.
+
+What it does not fix, and is worth being plain about: the token lives about eight hours
+and only the CLI rewrites it, so a tray watching usage you are running up in the browser
+still goes dark between CLI sessions. Reading the expiry makes that state legible and
+cheap. It does not make it shorter.
 
 - **the same expression drives the countdown you see.** "retrying at 22:37:04" is not a
   stored moment that might disagree with the code; it is that code, asked again
