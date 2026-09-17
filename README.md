@@ -203,6 +203,10 @@ So the expiry is read too, as evidence and never as an instruction:
   refresh it` is the ordinary overnight case. `token rejected, run Claude Code in a
   terminal to refresh it` is a token refused while the file still calls it valid -
   revoked, rescoped, or the endpoint at fault - and reads as the anomaly it is
+- neither carries a "retrying at" countdown. A tick past a refused token re-reads the
+  file and sends nothing, so a countdown to it promised a retry that never went out,
+  restarting every 90 seconds for as long as the token stayed dead. Running the CLI is
+  noticed on the next tick without a click
 - nothing is cached. The expiry is read from the blob with the token it describes, on
   every tick, exactly like the fingerprint. A stored copy would be a decision outliving
   its evidence, which is the pattern the whole design exists to avoid

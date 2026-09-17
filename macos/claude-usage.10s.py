@@ -1016,9 +1016,17 @@ def status_line(error, retry_at):
 
     `retry_at` comes from next_attempt_at, the same expression the poll
     itself consults, so what this counts down to is when we actually go.
+
+    Except for the credential: a tick past a refused token re-reads the file
+    and sends nothing, so a countdown to it promised a retry that never went
+    out, restarting every 90s for as long as the token stayed dead. Seen on
+    2026-09-17. The message already names the fix, and the fix is noticed on
+    the next tick without anyone clicking anything.
     """
     if not error:
         return None
+    if error in (AUTH_ERROR, EXPIRED_ERROR):
+        return error
     remaining = int(retry_at - time.time())
     if remaining <= 0:
         return f"{error}, retrying on next refresh"
