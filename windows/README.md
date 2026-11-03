@@ -3,8 +3,8 @@
 Your Claude session usage, drawn into the notification-area icon so it is visible
 without opening settings or running `/usage`.
 
-For what it is, how it refreshes and how it is hardened, see the
-**[root README](../README.md)**. This file covers the Windows build only. The macOS
+For what it is, see the **[root README](../README.md)**. For how it refreshes and how it
+is hardened, see **[how it works](../docs/how-it-works.md)**. This file covers the Windows build only. The macOS
 counterpart is in [`../macos/`](../macos/).
 
 ```
@@ -154,7 +154,7 @@ the line box wastes roughly a third of a 16px icon.
 
 ## Notes
 
-Beyond the shared hardening in the [root README](../README.md), two things are
+Beyond the shared hardening in [how it works](../docs/how-it-works.md), two things are
 specific to this build:
 
 - a named mutex prevents a second instance, which would add a second icon and double

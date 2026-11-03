@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="302" viewBox="0 0 420 302">
+  <title>macOS menu bar and dropdown, drawn from the plugin's output with sample data</title>
+  <defs>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  <style>
+    .ui { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Helvetica, Arial, sans-serif; font-size: 13px; fill: #f2f2f2; }
+    .mono { font-family: Menlo, Consolas, "DejaVu Sans Mono", monospace; font-size: 12px; fill: #f2f2f2; }
+    .dim { fill: #8a8a8e; }
+    .ok { fill: #00d700; }
+  </style>
+
+  <!-- menu bar -->
+  <rect x="0" y="0" width="420" height="26" fill="#262628"/>
+  <rect x="60" y="3" width="220" height="20" rx="5" fill="#ffffff" fill-opacity="0.16"/>
+  <text class="ui" x="68" y="18" xml:space="preserve">S:<tspan class="ok">41%</tspan> (1h52m)  W:<tspan class="ok">23%</tspan> (4d6h)</text>
+  <text class="ui" x="330" y="18">Tue 14:33</text>
+
+  <!-- dropdown -->
+  <g filter="url(#shadow)">
+    <rect x="60" y="30" width="350" height="262" rx="9" fill="#2b2b2d" stroke="#4a4a4c" stroke-width="1"/>
+  </g>
+  <text class="mono" x="74" y="54" xml:space="preserve">Session (5h)    41%   resets in 1h 52m (16:25)</text>
+  <text class="mono" x="74" y="76" xml:space="preserve">Weekly (all)    23%   resets Sat 07 Nov, 21:03</text>
+  <text class="mono" x="74" y="98" xml:space="preserve">Extra credits  £25.29 of £40.00   63% used</text>
+  <line x1="70" y1="111" x2="400" y2="111" stroke="#48484a"/>
+  <text class="ui" x="74" y="132">☐ Show credits in menu bar</text>
+  <text class="ui" x="74" y="154">☑ Colour in menu bar</text>
+  <text class="ui" x="74" y="176">☑ Open at login</text>
+  <line x1="70" y1="189" x2="400" y2="189" stroke="#48484a"/>
+  <text class="ui dim" x="74" y="210">Plan: Max</text>
+  <text class="ui dim" x="74" y="232">Percentages as of 14:33:03</text>
+  <text class="ui" x="74" y="254">Refresh now</text>
+  <text class="ui" x="74" y="276">Open usage settings</text>
+</svg>
