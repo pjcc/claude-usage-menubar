@@ -177,4 +177,6 @@ ordinals 135/136 - are documented in `windows/README.md`. Read it before touchin
   constant, change the evidence in its comment with it, or say plainly that it is now a guess
 - British spelling in prose and in user-visible strings (`colour`)
 - The READMEs are part of the deliverable. Behaviour changes to pacing, staleness or hardening
-  belong in the root `README.md` as well as in the code
+  belong in `docs/how-it-works.md` as well as in the code. The root `README.md` is the short,
+  user-facing page: change it only when what a user sees or does changes. Its images in
+  `docs/` use sample figures, never real account data

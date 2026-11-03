@@ -3,8 +3,8 @@
 Your Claude session and weekly usage limits, always visible in the macOS menu bar,
 so you don't have to open settings or run `/usage` to find out how much you have left.
 
-For what it is, how it refreshes and how it is hardened, see the
-**[root README](../README.md)**. This file covers the macOS build only. The Windows
+For what it is, see the **[root README](../README.md)**. For how it refreshes and how it
+is hardened, see **[how it works](../docs/how-it-works.md)**. This file covers the macOS build only. The Windows
 counterpart is in [`../windows/`](../windows/).
 
 ```
