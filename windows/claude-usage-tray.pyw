@@ -168,6 +168,10 @@ KIND_META = {
     "weekly_all": ("W", "Weekly (all)"),
     "weekly_opus": ("O", "Weekly (Opus)"),
     "weekly_sonnet": ("N", "Weekly (Sonnet)"),
+    # A weekly cap narrowed to one model or surface (the scope object names
+    # which). Unlisted, its first letter made it a second "W" row in the menu
+    # and tooltip, and it overwrote the real one in the log's rows dict.
+    "weekly_scoped": ("WS", "Weekly (scoped)"),
 }
 
 CURRENCY_SYMBOL = {"GBP": "£", "USD": "$", "EUR": "€", "JPY": "¥"}
