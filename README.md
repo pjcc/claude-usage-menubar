@@ -53,7 +53,7 @@ It starts with Windows from then on. New tray icons hide behind the `^` arrow, s
 
 ## Reading the display
 
-On Windows the tray icon only has room for a number, so it shows your session usage. Turn on **Show weekly in icon** to add the weekly figure underneath.
+Both show your session usage by default. Turn on **Show weekly in icon** (Windows) or **Show weekly in menu bar** (macOS) to add the weekly figure.
 
 | Icon | macOS | Meaning |
 |:---:|---|---|

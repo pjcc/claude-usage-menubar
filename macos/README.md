@@ -10,14 +10,18 @@ counterpart is in [`../windows/`](../windows/).
 ```
 S:41% (1h52m) W:23% (4d6h)
 └ session, 41% used, resets in 1h52m
-                     └ weekly, 23% used, resets in 4d6h
+                     └ weekly, 23% used, resets in 4d6h (with Show weekly on)
 ```
+
+By default only the session figure is shown. Turn on **Show weekly in menu bar** to add the
+all-models weekly figure. Every other limit, such as a weekly cap scoped to one model, is
+listed in the dropdown.
 
 The percentage is tinted green, amber or red by how much is left. The tag and countdown
 keep the system colour so the whole thing stays readable in light and dark mode.
 
 Clicking it opens a dropdown with full reset times, extra-usage credit spend, and
-three toggles.
+four toggles.
 
 ## Requirements
 
@@ -87,6 +91,7 @@ considered and why each was rejected, and `Loaded Plugins: 0` confirms none ever
 
 | Toggle | Default | Effect |
 |---|---|---|
+| Show weekly in menu bar | off | Adds the all-models weekly figure after the session one |
 | Show credits in menu bar | off | Appends extra-usage spend, for example `$5/50` |
 | Colour in menu bar | on | Off means no colour at all, not a different colour |
 | Open at login | on | Manages a LaunchAgent at `~/Library/LaunchAgents/com.ameba.SwiftBar.plist` |
