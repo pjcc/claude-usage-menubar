@@ -21,6 +21,7 @@
 #   --toggle-weekly    flip the weekly chip on/off in the menu bar
 #   --toggle-credits   flip the credits chip on/off in the menu bar
 #   --toggle-color     flip per-segment ANSI colour in the menu bar
+#   --toggle-clock     show reset times as a clock time instead of a countdown
 #   --toggle-login     add/remove the launch-at-login agent
 #   --force-refresh    clear the local throttle so the next render fetches
 
@@ -425,6 +426,13 @@ def force_refresh():
 def toggle_color():
     config = load_config()
     config["color"] = not config.get("color", True)
+    save_config(config)
+    nudge_swiftbar()
+
+
+def toggle_clock():
+    config = load_config()
+    config["reset_clock"] = not config.get("reset_clock", False)
     save_config(config)
     nudge_swiftbar()
 
@@ -881,6 +889,25 @@ def compact_duration(seconds):
     return f"{minutes}m"
 
 
+def compact_clock(value):
+    """'14:00' today, 'Thu 14:00' later this week, '17 Nov 14:00' beyond --
+    the same instant as compact_duration, read off a clock. A bare time that
+    is not today would name the wrong day, and a weekday seven days out would
+    read as today's, so each step adds just enough to stay unambiguous."""
+    when = parse_ts(value)
+    if when is None:
+        return ""
+    now = datetime.now(timezone.utc)
+    if when <= now:
+        return "now"
+    local, today = when.astimezone(), now.astimezone()
+    if local.date() == today.date():
+        return f"{local:%H:%M}"
+    if (local.date() - today.date()).days < 7:
+        return f"{local:%a %H:%M}"
+    return f"{local:%d %b %H:%M}"
+
+
 def describe_reset(value):
     """'resets in 3h 39m (15:40)' -- relative first, since that's what you act on."""
     when = parse_ts(value)
@@ -1069,6 +1096,12 @@ def render(data, plan, config, age=None, error=None, retry_at=0, fetched_at=0):
     spend = data.get("spend") if isinstance(data.get("spend"), dict) else {}
     show_credits = bool(config.get("show_credits", False))
     in_title = {SESSION_TAG}
+    # A clock time ('14:00') or a countdown ('3h39m'): the same instant either
+    # way, so this is purely how you prefer to read it.
+    reset_label = (
+        compact_clock if config.get("reset_clock", False)
+        else lambda value: compact_duration(seconds_until(value))
+    )
     if config.get("show_weekly", False):
         in_title.add(WEEKLY_TAG)
 
@@ -1093,7 +1126,7 @@ def render(data, plan, config, age=None, error=None, retry_at=0, fetched_at=0):
         if use_color:
             percent = ansi_wrap(percent, alert_code(row["percent"], row["severity"]))
         chip = f"{row['tag']}:{percent}"
-        span = compact_duration(seconds_until(row["resets_at"]))
+        span = reset_label(row["resets_at"])
         if span:
             chip = f"{chip} ({span})"
         chips.append(chip)
@@ -1205,6 +1238,9 @@ def print_controls(config):
         "Show credits in menu bar", config.get("show_credits", False), "--toggle-credits"
     )
     toggle_line("Colour in menu bar", config.get("color", True), "--toggle-color")
+    toggle_line(
+        "Reset as clock time", config.get("reset_clock", False), "--toggle-clock"
+    )
     toggle_line("Open at login", login_enabled(), "--toggle-login")
 
 
@@ -1230,6 +1266,8 @@ def main():
             toggle_login()
         elif args[0] == "--toggle-color":
             toggle_color()
+        elif args[0] == "--toggle-clock":
+            toggle_clock()
         elif args[0] == "--force-refresh":
             force_refresh()
         return
