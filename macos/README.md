@@ -15,13 +15,14 @@ S:41% (1h52m) W:23% (4d6h)
 
 By default only the session figure is shown. Turn on **Show weekly in menu bar** to add the
 all-models weekly figure. Every other limit, such as a weekly cap scoped to one model, is
-listed in the dropdown.
+listed in the dropdown. Turn on **Reset as clock time** to show when each window resets
+rather than how long is left: `S:41% (14:00) W:23% (Mon 12:00)`.
 
 The percentage is tinted green, amber or red by how much is left. The tag and countdown
 keep the system colour so the whole thing stays readable in light and dark mode.
 
 Clicking it opens a dropdown with full reset times, extra-usage credit spend, and
-four toggles.
+five toggles.
 
 ## Requirements
 
@@ -94,6 +95,7 @@ considered and why each was rejected, and `Loaded Plugins: 0` confirms none ever
 | Show weekly in menu bar | off | Adds the all-models weekly figure after the session one |
 | Show credits in menu bar | off | Appends extra-usage spend, for example `$5/50` |
 | Colour in menu bar | on | Off means no colour at all, not a different colour |
+| Reset as clock time | off | Shows the reset as `14:00`, `Mon 12:00` or `17 Nov 12:00` instead of a countdown |
 | Open at login | on | Manages a LaunchAgent at `~/Library/LaunchAgents/com.ameba.SwiftBar.plist` |
 
 **Refresh now** forces a poll, ignoring every backoff including the server's, with no
