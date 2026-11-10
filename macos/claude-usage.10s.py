@@ -18,6 +18,7 @@
 # failure -- see MIN_FETCH_SECONDS and next_attempt_at().
 #
 # Self-invoking actions (driven by the dropdown):
+#   --toggle-weekly    flip the weekly chip on/off in the menu bar
 #   --toggle-credits   flip the credits chip on/off in the menu bar
 #   --toggle-color     flip per-segment ANSI colour in the menu bar
 #   --toggle-login     add/remove the launch-at-login agent
@@ -173,7 +174,17 @@ KIND_META = {
     "weekly_all": ("W", "Weekly (all)"),
     "weekly_opus": ("O", "Weekly (Opus)"),
     "weekly_sonnet": ("N", "Weekly (Sonnet)"),
+    # A weekly cap narrowed to one model or surface (the scope object names
+    # which). Unlisted, its first letter made it a second "W", which doubled
+    # the weekly chip and overwrote the real one in the log's rows dict.
+    "weekly_scoped": ("WS", "Weekly (scoped)"),
 }
+
+# The menu bar carries the session figure, plus the all-models weekly one when
+# "Show weekly in menu bar" is on. Every other cap stays in the dropdown, where
+# an unknown kind still appears as its own row with no code change.
+SESSION_TAG = "S"
+WEEKLY_TAG = "W"
 
 CURRENCY_SYMBOL = {"GBP": "£", "USD": "$", "EUR": "€", "JPY": "¥"}
 
@@ -300,6 +311,13 @@ def nudge_swiftbar():
         check=False,
         capture_output=True,
     )
+
+
+def toggle_weekly():
+    config = load_config()
+    config["show_weekly"] = not config.get("show_weekly", False)
+    save_config(config)
+    nudge_swiftbar()
 
 
 def toggle_credits():
@@ -1050,8 +1068,11 @@ def render(data, plan, config, age=None, error=None, retry_at=0, fetched_at=0):
     rows = collect_limits(data)
     spend = data.get("spend") if isinstance(data.get("spend"), dict) else {}
     show_credits = bool(config.get("show_credits", False))
+    in_title = {SESSION_TAG}
+    if config.get("show_weekly", False):
+        in_title.add(WEEKLY_TAG)
 
-    # Menu bar: "S:46% (3h39m) W:7% (5d0h)". Each limit's percentage is tinted
+    # Menu bar: "S:46% (3h39m)", or "S:46% (3h39m) W:7% (5d0h)" with weekly on. Each limit's percentage is tinted
     # on its own, so you can see at a glance *which* one is the tight one.
     # Past a certain age the tint comes off: a figure we cannot vouch for must
     # not be able to read as a healthy green.
@@ -1060,6 +1081,8 @@ def render(data, plan, config, age=None, error=None, retry_at=0, fetched_at=0):
     )
     chips = []
     for row in rows:
+        if row["tag"] not in in_title:
+            continue
         if unreliable(row, fetched_at, age):
             # The window this figure counted has ended. Zero would be the
             # tempting guess, and the wrong one: it invites you to spend a
@@ -1176,6 +1199,9 @@ def print_footer():
 
 def print_controls(config):
     toggle_line(
+        "Show weekly in menu bar", config.get("show_weekly", False), "--toggle-weekly"
+    )
+    toggle_line(
         "Show credits in menu bar", config.get("show_credits", False), "--toggle-credits"
     )
     toggle_line("Colour in menu bar", config.get("color", True), "--toggle-color")
@@ -1196,7 +1222,9 @@ def fail(detail, config, retry_at=0):
 def main():
     args = sys.argv[1:]
     if args:
-        if args[0] == "--toggle-credits":
+        if args[0] == "--toggle-weekly":
+            toggle_weekly()
+        elif args[0] == "--toggle-credits":
             toggle_credits()
         elif args[0] == "--toggle-login":
             toggle_login()
